@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..50ede77 100644
+index 4b9242c..a409148 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -2,6 +2,8 @@
@@ -11,7 +11,7 @@ index 4b9242c..50ede77 100644
  #include <cstdint>
  #include <vector>
  #include <string>
-@@ -246,13 +248,37 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+@@ -246,13 +248,34 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                 const R5900Context *ctx)
  {
      (void)rdram;
@@ -23,14 +23,9 @@ index 4b9242c..50ede77 100644
 -    (void)ctx;
 -    // TODO we dont need this anymore so on next release it will be deleted
 +    // Debug aid: PS2X_WATCH=0x448e10,0x40 logs guest writes into [start,start+len) (first 60 hits).
-+    struct WatchCfg
++    static uint32_t watchLo = 0u, watchHi = 0u;
++    static const bool watchInit = []
 +    {
-+        uint32_t lo = 0, hi = 0;
-+        std::atomic<int> hits{0};
-+    };
-+    static WatchCfg cfg = []
-+    {
-+        WatchCfg c;
 +        if (const char *env = std::getenv("PS2X_WATCH"))
 +        {
 +            char *end = nullptr;
@@ -38,13 +33,15 @@ index 4b9242c..50ede77 100644
 +            unsigned long n = 0x10;
 +            if (end && *end == ',')
 +                n = std::strtoul(end + 1, nullptr, 0);
-+            c.lo = static_cast<uint32_t>(a);
-+            c.hi = static_cast<uint32_t>(a + n);
++            watchLo = static_cast<uint32_t>(a);
++            watchHi = static_cast<uint32_t>(a + n);
 +        }
-+        return c;
++        return true;
 +    }();
-+    if (cfg.hi != 0u && (guestAddr & 0x1FFFFFFFu) + size > cfg.lo && (guestAddr & 0x1FFFFFFFu) < cfg.hi &&
-+        cfg.hits.fetch_add(1, std::memory_order_relaxed) < 60)
++    (void)watchInit;
++    static std::atomic<int> watchHits{0};
++    if (watchHi != 0u && (guestAddr & 0x1FFFFFFFu) + size > watchLo && (guestAddr & 0x1FFFFFFFu) < watchHi &&
++        watchHits.fetch_add(1, std::memory_order_relaxed) < 60)
 +    {
 +        std::fprintf(stderr, "[watch] write addr=0x%x size=%u val=%llx pc=0x%x ra=0x%x sp=0x%x\n", guestAddr, size,
 +                     static_cast<unsigned long long>(valueLo), ctx ? ctx->pc : 0u,
