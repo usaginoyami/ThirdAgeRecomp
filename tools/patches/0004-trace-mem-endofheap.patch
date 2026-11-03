@@ -1,0 +1,69 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..9863999 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "Common.h"
+ #include "System.h"
+ 
+@@ -589,6 +590,8 @@ namespace ps2_syscalls
+                                  ? runtime->guestHeapLimit()
+                                  : kDefaultGuestHeapEnd;
+ 
++        std::fprintf(stderr, "[EndOfHeap] ret=0x%x base=0x%x end=0x%x\n", ret,
++                     runtime ? runtime->guestHeapBase() : 0u, runtime ? runtime->guestHeapEnd() : 0u);
+         setReturnU32(ctx, ret);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 2119eea..bfebd7a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2,6 +2,7 @@
+ #include <string>
+ #include <cstdlib>
+ #include <cstdio>
++#include <cstring>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -1434,6 +1435,38 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     if (traced)
+     {
+         std::fprintf(stderr, "[ret ] 0x%x -> v0=%x v1=%x\n", targetPc, GPR_U32(ctx, 2), GPR_U32(ctx, 3));
++        // PS2X_TRACE_MEM=0x377dd0,0x35f3f0 : prints these guest words after each traced return.
++        static const std::vector<uint32_t> memAddrs = []
++        {
++            std::vector<uint32_t> out;
++            if (const char *env = std::getenv("PS2X_TRACE_MEM"))
++            {
++                std::string text(env);
++                size_t pos = 0;
++                while (pos < text.size())
++                {
++                    const size_t end = text.find(',', pos);
++                    const std::string item = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
++                    if (!item.empty())
++                        out.push_back(static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 0)));
++                    if (end == std::string::npos)
++                        break;
++                    pos = end + 1;
++                }
++            }
++            return out;
++        }();
++        if (!memAddrs.empty())
++        {
++            std::fprintf(stderr, "[mem ]");
++            for (uint32_t addr : memAddrs)
++            {
++                uint32_t word = 0;
++                std::memcpy(&word, rdram + (addr & 0x1FFFFFFFu), sizeof(word));
++                std::fprintf(stderr, " %x=%x", addr, word);
++            }
++            std::fprintf(stderr, "\n");
++        }
+     }
+ 
+     if (isStopRequested() || ctx->pc == 0u)

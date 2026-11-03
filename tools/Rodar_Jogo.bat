@@ -16,6 +16,8 @@ if not exist "extract\MODULES" (
 if not exist "extract\SLUS_210.27" copy /y "dados\SLUS_210.27" "extract\SLUS_210.27" >nul
 rem Opcional: tools\trace_calls.txt com enderecos (ex.: 0x1b8538,0x26ba50) para logar argumentos e retorno dessas chamadas
 if exist "tools\trace_calls.txt" set /p PS2X_TRACE_CALLS=<"tools\trace_calls.txt"
+rem Opcional: tools\trace_mem.txt com enderecos de memoria a imprimir apos cada chamada rastreada
+if exist "tools\trace_mem.txt" set /p PS2X_TRACE_MEM=<"tools\trace_mem.txt"
 echo Rodando. Deixe uns 30-60 segundos e feche a janela do jogo. Log em tools\boot.log
 "%EXE%" "extract\SLUS_210.27" > tools\boot.log 2>&1
 echo.
