@@ -20,6 +20,8 @@ rem Opcional: tools\trace_mem.txt com enderecos de memoria a imprimir apos cada 
 if exist "tools\trace_mem.txt" set /p PS2X_TRACE_MEM=<"tools\trace_mem.txt"
 rem Opcional: tools\trace_watch.txt (ex.: 0x448e10,0x40) loga quem escreve nessa faixa de memoria
 if exist "tools\trace_watch.txt" set /p PS2X_WATCH=<"tools\trace_watch.txt"
+rem Opcional: crie tools\census.txt (qualquer conteudo) para contar as funcoes mais chamadas (patch 0009)
+if exist "tools\census.txt" set PS2X_CENSUS=1
 echo Rodando. Deixe uns 30-60 segundos e feche a janela do jogo. Log em tools\boot.log
 "%EXE%" "extract\SLUS_210.27" > tools\boot.log 2>&1
 echo.

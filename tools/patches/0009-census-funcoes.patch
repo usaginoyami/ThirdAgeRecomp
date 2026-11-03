@@ -1,0 +1,44 @@
+diff --git a/ps2xRuntime/include/ps2_log.h b/ps2xRuntime/include/ps2_log.h
+--- a/ps2xRuntime/include/ps2_log.h
++++ b/ps2xRuntime/include/ps2_log.h
+@@ -202,7 +202,39 @@
+ }
+ inline void print_saved_location() {}
+ }
+-#define PS_LOG_ENTRY(name) ((void)0)
++// Debug aid: PS2X_CENSUS=1 conta entradas de funcoes recompiladas e imprime as mais chamadas.
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <unordered_map>
++namespace ps2_log
++{
++inline void census_hit(const char *name)
++{
++    static const bool enabled = std::getenv("PS2X_CENSUS") != nullptr;
++    if (!enabled)
++        return;
++    static std::mutex mtx;
++    static std::unordered_map<std::string, uint64_t> counts;
++    static uint64_t total = 0;
++    static int dumps = 0;
++    std::lock_guard<std::mutex> lock(mtx);
++    ++counts[name];
++    if (++total >= 3000000ull && dumps < 8)
++    {
++        std::vector<std::pair<std::string, uint64_t>> v(counts.begin(), counts.end());
++        std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++        std::fprintf(stderr, "[census] dump %d (3M entradas)\n", dumps);
++        for (size_t i = 0; i < v.size() && i < 40; ++i)
++            std::fprintf(stderr, "[census] %8llu %s\n", (unsigned long long)v[i].second, v[i].first.c_str());
++        ++dumps;
++        counts.clear();
++        total = 0;
++    }
++}
++}
++#define PS_LOG_ENTRY(name) ps2_log::census_hit(name)
+ #define PS2_IF_AGRESSIVE_LOGS(code) ((void)0)
+ 
+ #endif
