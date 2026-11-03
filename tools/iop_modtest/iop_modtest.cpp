@@ -1,6 +1,7 @@
 // Carrega os modulos IRX do disco (pasta extraida) no emulador de IOP do PS2Recomp e
 // relata o resultado de cada um. Uso: iop_modtest <pasta com MODULES\> [modulo ...]
 #include "ps2x/iop/iop_subsystem.h"
+#include "ps2x/iop/iop_sreg.h"
 
 #include <algorithm>
 #include <cctype>
@@ -110,7 +111,7 @@ public:
     void log(LogLevel l, std::string_view m) override
     {
         static const char *n[] = {"DEBUG", "INFO", "WARN", "ERROR"};
-        if (l >= LogLevel::Warning || verbose) std::cout << "    [" << n[static_cast<int>(l)] << "] " << m << "\n";
+        if (l >= LogLevel::Info || verbose) std::cout << "    [" << n[static_cast<int>(l)] << "] " << m << "\n";
     }
     bool sendSifCommand(uint32_t id, const void *pkt, size_t n) override
     {
@@ -154,6 +155,10 @@ int main(int argc, char **argv)
         std::cout << "   handled=" << r.handled << " moduleId=" << r.moduleId << " startResult=" << r.startResult << "\n";
         if (r.moduleId <= 0) ++fails;
     }
+    // Simula o EE: entrega SET_SREG(0x1f/0x1e) e deixa o IOP rodar um tempo
+    ps2x::iop::iopSifSregSet(0x1f, 0x403b40);
+    ps2x::iop::iopSifSregSet(0x1e, 0x40bb40);
+    for (int i = 0; i < 400; ++i) iop.runEeCycles(4000000);
     const auto snap = iop.debugSnapshot();
     std::cout << "\nemulador: modulos=" << snap.emulatorLoadedModules << " threads=" << snap.emulatorThreads
               << " servidores RPC=" << snap.emulatorRpcServers << " instrucoes=" << snap.emulatorInstructions << "\n";
