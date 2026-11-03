@@ -11,6 +11,7 @@ Depois acrescenta `entry_` para alvos de chamada indireta que caem no meio de um
 Uso:  python tools/preencher_gaps.py dados/SLUS_210.27 config/thirdage.ghidra.orig.csv config/thirdage.ghidra.csv
 Sem 'saida', reescreve o CSV de entrada (guarda o original em *.orig.csv na primeira vez).
 """
+import bisect
 import csv
 import os
 import shutil
@@ -131,6 +132,25 @@ def main():
         inicios = sorted(conhecidos)
         novas_e += 1
     print(f"entradas acrescentadas por ponteiro: {novas_e}")
+    # Normalizacao: o recompilador descarta funcoes cujo inicio cai dentro do intervalo de um registro
+    # entry_ (ex.: entry_0023c230 ia ate 0x23c258 e engolia FUN_0023c238/240/248). Corta o fim de cada
+    # entry_ no proximo inicio de funcao e remove entry_ que coincide com o inicio de uma funcao.
+    fun_starts = sorted({int(r[1], 16) for r in body if not r[0].startswith(("entry_", "caseD_"))})
+    novo, cortados, removidos = [], 0, 0
+    for r in body:
+        if r[0].startswith("entry_"):
+            s0, e0 = int(r[1], 16), int(r[2], 16)
+            if s0 in fun_starts:
+                removidos += 1
+                continue
+            j = bisect.bisect_right(fun_starts, s0)
+            if j < len(fun_starts) and fun_starts[j] < e0:
+                e0 = fun_starts[j]
+                r = [r[0], r[1], f"0x{e0:08X}", str(e0 - s0)]
+                cortados += 1
+        novo.append(r)
+    body = novo
+    print(f"entry_ cortados: {cortados}; entry_ duplicados de funcao removidos: {removidos}")
     body.sort(key=lambda r: (int(r[1], 16), r[0]))
     with open(out, "w", newline="") as f:
         wr = csv.writer(f, lineterminator="\n")
