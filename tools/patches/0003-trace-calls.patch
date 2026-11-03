@@ -1,0 +1,54 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..2119eea 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,7 @@
++#include <vector>
++#include <string>
++#include <cstdlib>
++#include <cstdio>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -1396,7 +1400,41 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++
++    // Debug aid: PS2X_TRACE_CALLS=0x1b8538,0x26ba50 logs arguments and $v0 of calls to these addresses.
++    static const std::vector<uint32_t> traceTargets = []
++    {
++        std::vector<uint32_t> out;
++        if (const char *env = std::getenv("PS2X_TRACE_CALLS"))
++        {
++            std::string text(env);
++            size_t pos = 0;
++            while (pos < text.size())
++            {
++                const size_t end = text.find(',', pos);
++                const std::string item = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
++                if (!item.empty())
++                    out.push_back(static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 0)));
++                if (end == std::string::npos)
++                    break;
++                pos = end + 1;
++            }
++        }
++        return out;
++    }();
++    const bool traced = !traceTargets.empty() &&
++                        std::find(traceTargets.begin(), traceTargets.end(), targetPc) != traceTargets.end();
++    if (traced)
++    {
++        std::fprintf(stderr, "[call] 0x%x from 0x%x a0=%x a1=%x a2=%x a3=%x t0=%x ra=%x\n", targetPc, sourcePc,
++                     GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 8),
++                     GPR_U32(ctx, 31));
++    }
+     targetFn(rdram, ctx, this);
++    if (traced)
++    {
++        std::fprintf(stderr, "[ret ] 0x%x -> v0=%x v1=%x\n", targetPc, GPR_U32(ctx, 2), GPR_U32(ctx, 3));
++    }
+ 
+     if (isStopRequested() || ctx->pc == 0u)
+     {
