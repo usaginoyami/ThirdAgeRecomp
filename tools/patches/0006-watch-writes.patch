@@ -1,0 +1,56 @@
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..50ede77 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -2,6 +2,8 @@
+ #define PS2_RUNTIME_H
+ 
+ #include <cstring>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstdint>
+ #include <vector>
+ #include <string>
+@@ -246,13 +248,37 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                const R5900Context *ctx)
+ {
+     (void)rdram;
+-    (void)guestAddr;
+-    (void)size;
+-    (void)valueLo;
+     (void)valueHi;
+     (void)op;
+-    (void)ctx;
+-    // TODO we dont need this anymore so on next release it will be deleted
++    // Debug aid: PS2X_WATCH=0x448e10,0x40 logs guest writes into [start,start+len) (first 60 hits).
++    struct WatchCfg
++    {
++        uint32_t lo = 0, hi = 0;
++        std::atomic<int> hits{0};
++    };
++    static WatchCfg cfg = []
++    {
++        WatchCfg c;
++        if (const char *env = std::getenv("PS2X_WATCH"))
++        {
++            char *end = nullptr;
++            const unsigned long a = std::strtoul(env, &end, 0);
++            unsigned long n = 0x10;
++            if (end && *end == ',')
++                n = std::strtoul(end + 1, nullptr, 0);
++            c.lo = static_cast<uint32_t>(a);
++            c.hi = static_cast<uint32_t>(a + n);
++        }
++        return c;
++    }();
++    if (cfg.hi != 0u && (guestAddr & 0x1FFFFFFFu) + size > cfg.lo && (guestAddr & 0x1FFFFFFFu) < cfg.hi &&
++        cfg.hits.fetch_add(1, std::memory_order_relaxed) < 60)
++    {
++        std::fprintf(stderr, "[watch] write addr=0x%x size=%u val=%llx pc=0x%x ra=0x%x sp=0x%x\n", guestAddr, size,
++                     static_cast<unsigned long long>(valueLo), ctx ? ctx->pc : 0u,
++                     ctx ? static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) : 0u,
++                     ctx ? static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29])) : 0u);
++    }
+ }
+ 
+ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
