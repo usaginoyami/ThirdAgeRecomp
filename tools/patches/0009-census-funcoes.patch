@@ -1,12 +1,12 @@
 diff --git a/ps2xRuntime/include/ps2_log.h b/ps2xRuntime/include/ps2_log.h
 --- a/ps2xRuntime/include/ps2_log.h
 +++ b/ps2xRuntime/include/ps2_log.h
-@@ -202,7 +202,39 @@
- }
- inline void print_saved_location() {}
- }
--#define PS_LOG_ENTRY(name) ((void)0)
+@@ -137,6 +137,45 @@
+ #define RUNTIME_LOG(x) do {} while(0)
+ #endif
+ 
 +// Debug aid: PS2X_CENSUS=1 conta entradas de funcoes recompiladas e imprime as mais chamadas.
++// O trace de entrada/saida em arquivo (lento) so liga com PS2X_FNLOG=1.
 +#include <atomic>
 +#include <cstdint>
 +#include <cstdio>
@@ -14,6 +14,11 @@ diff --git a/ps2xRuntime/include/ps2_log.h b/ps2xRuntime/include/ps2_log.h
 +#include <unordered_map>
 +namespace ps2_log
 +{
++inline bool fnlog_enabled()
++{
++    static const bool enabled = std::getenv("PS2X_FNLOG") != nullptr;
++    return enabled;
++}
 +inline void census_hit(const char *name)
 +{
 +    static const bool enabled = std::getenv("PS2X_CENSUS") != nullptr;
@@ -38,6 +43,34 @@ diff --git a/ps2xRuntime/include/ps2_log.h b/ps2xRuntime/include/ps2_log.h
 +    }
 +}
 +}
++
+ #if AGRESSIVE_LOGS
+ 
+ namespace ps2_log
+@@ -162,6 +201,9 @@
+ }
+ inline void log_entry(const char *name)
+ {
++    census_hit(name);
++    if (!fnlog_enabled())
++        return;
+     for (int i = 0; i < depth(); ++i)
+         log_stream() << '\t';
+     log_stream() << ">> " << name << " enter\n";
+@@ -170,6 +212,8 @@
+ }
+ inline void log_exit(const char *name)
+ {
++    if (!fnlog_enabled())
++        return;
+     depth()--;
+     for (int i = 0; i < depth(); ++i)
+         log_stream() << '\t';
+@@ -202,7 +246,7 @@
+ }
+ inline void print_saved_location() {}
+ }
+-#define PS_LOG_ENTRY(name) ((void)0)
 +#define PS_LOG_ENTRY(name) ps2_log::census_hit(name)
  #define PS2_IF_AGRESSIVE_LOGS(code) ((void)0)
  
