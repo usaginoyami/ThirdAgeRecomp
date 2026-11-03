@@ -159,6 +159,13 @@ int main(int argc, char **argv)
     ps2x::iop::iopSifSregSet(0x1f, 0x403b40);
     ps2x::iop::iopSifSregSet(0x1e, 0x40bb40);
     for (int i = 0; i < 400; ++i) iop.runEeCycles(4000000);
+    // Simula o EE enviando o comando de usuario cid=1 (o jogo faz isso e espera a resposta do AUDIOPF)
+    {
+        uint32_t pkt[4] = {0x10u, 0x360000u, 1u, 0u};
+        ps2x::iop::iopSifCmdPush(1u, pkt, sizeof pkt);
+        std::cout << "-- EE enviou SIF cmd cid=1\n";
+        for (int i = 0; i < 100; ++i) iop.runEeCycles(4000000);
+    }
     const auto snap = iop.debugSnapshot();
     std::cout << "\nemulador: modulos=" << snap.emulatorLoadedModules << " threads=" << snap.emulatorThreads
               << " servidores RPC=" << snap.emulatorRpcServers << " instrucoes=" << snap.emulatorInstructions << "\n";

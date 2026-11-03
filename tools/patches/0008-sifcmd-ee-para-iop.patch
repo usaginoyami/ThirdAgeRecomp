@@ -1,0 +1,217 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_sreg.h b/ps2xIOP/include/ps2x/iop/iop_sreg.h
+index 5030451..c277dac 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_sreg.h
++++ b/ps2xIOP/include/ps2x/iop/iop_sreg.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <cstdint>
++#include <vector>
+ 
+ namespace ps2x::iop
+ {
+@@ -7,4 +8,9 @@ namespace ps2x::iop
+     // SIF command 0x80000001 (index, value); read by IOP modules through sifcmd import 6.
+     uint32_t iopSifSregGet(uint32_t index);
+     void iopSifSregSet(uint32_t index, uint32_t value);
++
++    // Fila de comandos SIF do EE para o IOP (sceSifSendCmd com cid de usuario). O emulador do IOP a esvazia em
++    // runCycles e chama o handler registrado pelo modulo com sceSifAddCmdHandler (sifcmd import 10).
++    void iopSifCmdPush(uint32_t cid, const void *packet, uint32_t size);
++    bool iopSifCmdPop(uint32_t &cid, std::vector<uint8_t> &packet);
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 1b7deb2..e8bd204 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,3 +1,4 @@
++#include "ps2x/iop/iop_sreg.h"
+ #include <cstdlib>
+ #include <cstdio>
+ #include "iop_emulator.h"
+@@ -568,6 +569,37 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = false;
+         }
+ 
++        // Entrega ao IOP os comandos SIF enviados pelo EE (sceSifSendCmd com cid de usuario): chama o handler
++        // registrado pelo modulo (sceSifAddCmdHandler) com o pacote copiado para a RAM do IOP.
++        void drainEeSifCommands()
++        {
++            uint32_t cid = 0;
++            std::vector<uint8_t> packet;
++            while (iopSifCmdPop(cid, packet))
++            {
++                uint32_t function = 0, argument = 0, handlerGp = 0;
++                if (!rpc.findCmdHandler(cid, function, argument, handlerGp))
++                {
++                    char line[96];
++                    std::snprintf(line, sizeof line, "[IOP] EE->IOP SIF cmd cid=0x%X sem handler", cid);
++                    log(LogLevel::Warning, line);
++                    continue;
++                }
++                if (eeCmdBuffer == 0u)
++                    eeCmdBuffer = allocate(128u, 16u);
++                if (eeCmdBuffer == 0u)
++                    continue;
++                const size_t size = std::min<size_t>(packet.size(), 112u);
++                writeRam(eeCmdBuffer, packet.data(), size);
++                {
++                    char line[128];
++                    std::snprintf(line, sizeof line, "[IOP] EE->IOP SIF cmd cid=0x%X -> handler 0x%X", cid, function);
++                    log(LogLevel::Info, line);
++                }
++                (void)callFunction(function, eeCmdBuffer, argument, 0u, 0u, handlerGp, 200000u);
++            }
++        }
++
+         void runCycles(uint64_t cycles) noexcept
+         {
+             try
+@@ -575,6 +607,7 @@ namespace ps2x::iop::detail
+                 const uint64_t target = totalCycles + cycles;
+                 while (totalCycles < target)
+                 {
++                    drainEeSifCommands();
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this);
+@@ -700,6 +733,7 @@ namespace ps2x::iop::detail
+         IopCdvd cdvd;
+         IopVblank vblank;
+         IopRpcBridge rpc;
++        uint32_t eeCmdBuffer = 0u;
+         IopSysclib sysclib;
+         IopStdio stdio;
+         IopHeaplib heaplib;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index eb02e6d..a9e1840 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -10,6 +10,8 @@
+ #include <array>
+ #include <cstdio>
+ #include <cstring>
++#include <deque>
++#include <mutex>
+ #include <limits>
+ #include <vector>
+ 
+@@ -18,6 +20,24 @@ namespace ps2x::iop
+     namespace
+     {
+         uint32_t g_iopSregs[256];
++        std::mutex g_cmdMutex;
++        std::deque<std::pair<uint32_t, std::vector<uint8_t>>> g_cmdQueue;
++    }
++    void iopSifCmdPush(uint32_t cid, const void *packet, uint32_t size)
++    {
++        std::lock_guard<std::mutex> lock(g_cmdMutex);
++        const auto *bytes = static_cast<const uint8_t *>(packet);
++        g_cmdQueue.emplace_back(cid, std::vector<uint8_t>(bytes, bytes + size));
++    }
++    bool iopSifCmdPop(uint32_t &cid, std::vector<uint8_t> &packet)
++    {
++        std::lock_guard<std::mutex> lock(g_cmdMutex);
++        if (g_cmdQueue.empty())
++            return false;
++        cid = g_cmdQueue.front().first;
++        packet = std::move(g_cmdQueue.front().second);
++        g_cmdQueue.pop_front();
++        return true;
+     }
+     uint32_t iopSifSregGet(uint32_t index) { return g_iopSregs[index & 0xFFu]; }
+     void iopSifSregSet(uint32_t index, uint32_t value) { g_iopSregs[index & 0xFFu] = value; }
+@@ -33,10 +53,22 @@ namespace ps2x::iop::detail
+     void IopRpcBridge::reset()
+     {
+         m_servers.clear();
++        m_cmdHandlers.clear();
+         m_nextDmaId = 1u;
+         m_sifInitialized = true; // the IOP base image (SIFMAN/SIFCMD) is already running after reset
+     }
+ 
++    bool IopRpcBridge::findCmdHandler(uint32_t cid, uint32_t &function, uint32_t &argument, uint32_t &gp) const noexcept
++    {
++        const auto it = m_cmdHandlers.find(cid);
++        if (it == m_cmdHandlers.end() || it->second.function == 0u)
++            return false;
++        function = it->second.function;
++        argument = it->second.argument;
++        gp = it->second.gp;
++        return true;
++    }
++
+     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
+     {
+         const auto setV0 = [&](uint32_t value)
+@@ -161,8 +193,9 @@ namespace ps2x::iop::detail
+             setV0(previous);
+             return true;
+         }
+-        case 10: // sceSifAddCmdHandler: only logged for now
++        case 10: // sceSifAddCmdHandler(cid, func, harg)
+             {
++                m_cmdHandlers[cpu.gpr[4]] = CmdHandler{cpu.gpr[5], cpu.gpr[6], cpu.gpr[28]};
+                 char line[96];
+                 std::snprintf(line, sizeof line, "[IOP] sceSifAddCmdHandler cid=0x%X fn=0x%X", cpu.gpr[4], cpu.gpr[5]);
+                 m_host.log(LogLevel::Info, line);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index a4286ba..26d3fa1 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -52,6 +52,7 @@ namespace ps2x::iop::detail
+         void onSifTransfer(const SifTransfer &transfer);
+         void removeServersInRange(uint32_t base, uint32_t size);
+ 
++        [[nodiscard]] bool findCmdHandler(uint32_t cid, uint32_t &function, uint32_t &argument, uint32_t &gp) const noexcept;
+         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
+         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
+ 
+@@ -71,6 +72,13 @@ namespace ps2x::iop::detail
+         IopHost &m_host;
+         IopMemory &m_memory;
+         IopKernel &m_kernel;
++        struct CmdHandler
++        {
++            uint32_t function = 0;
++            uint32_t argument = 0;
++            uint32_t gp = 0;
++        };
++        std::unordered_map<uint32_t, CmdHandler> m_cmdHandlers;
+         std::unordered_map<uint32_t, RpcServer> m_servers;
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index d202798..b2aeb8d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -999,6 +999,30 @@ namespace ps2_syscalls
+             RUNTIME_LOG("[sceSifSendCmd] SET_SREG(EE->IOP) idx=0x" << std::hex << idx << " val=0x" << val << std::dec << std::endl);
+         }
+ 
++        else if ((cid & 0x80000000u) == 0u && packetSize >= 16u && packetSize <= 112u)
++        {
++            // Comando de usuario EE -> IOP: monta o cabecalho como o SIFCMD real e entrega ao handler do modulo.
++            std::vector<uint8_t> packet(packetSize);
++            bool ok = true;
++            for (uint32_t i = 0; i < packetSize && ok; ++i)
++            {
++                const uint8_t *src = getConstMemPtr(rdram, packetAddr + i);
++                if (!src)
++                    ok = false;
++                else
++                    packet[i] = *src;
++            }
++            if (ok)
++            {
++                const uint32_t extraSize = (sizeExtra > 0u) ? sizeExtra : 0u;
++                const uint32_t sizeWord = packetSize | (extraSize << 8u);
++                std::memcpy(packet.data() + 0u, &sizeWord, sizeof(sizeWord));
++                std::memcpy(packet.data() + 4u, &destExtra, sizeof(destExtra));
++                std::memcpy(packet.data() + 8u, &cid, sizeof(cid));
++                ps2x::iop::iopSifCmdPush(cid, packet.data(), packetSize);
++            }
++        }
++
+         static int logCount = 0;
+         if (logCount < 40)
+         {
