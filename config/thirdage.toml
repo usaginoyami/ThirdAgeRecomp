@@ -1,0 +1,12 @@
+# Configuração do recompilador para The Lord of the Rings: The Third Age (PS2)
+# Preencher depois de extrair o ELF do disco (ver docs/PLANO.md, fase 0).
+
+[general]
+input = "dados/SLUS_XXX.XX"      # ELF extraído do SYSTEM.CNF (BOOT2); não vai ao GitHub
+output = "generated/"
+single_file_output = false
+
+# Funções a stubar/pular e patches de instrução entram aqui conforme o boot avança.
+# Nomes das funções do SDK identificadas ficam em config/symbols/.
+# stubs = []
+# skip = []

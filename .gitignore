@@ -1,0 +1,26 @@
+# Nada do jogo vai ao GitHub
+dados/
+disc/
+*.iso
+*.bin
+*.cue
+*.img
+*.elf
+SLUS_*
+SLES_*
+*.irx
+*.mcd
+*.ps2
+*.pss
+
+# Saidas geradas
+generated/
+build/
+out/
+saves/
+
+# Python / editor
+__pycache__/
+*.pyc
+.vscode/
+.idea/
