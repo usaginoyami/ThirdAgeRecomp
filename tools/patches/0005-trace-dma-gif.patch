@@ -1,0 +1,25 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..eb2e7e8 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -1682,6 +1683,15 @@ void PS2Memory::processPendingTransfers()
+     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+     {
+         auto &p = m_pendingGifTransfers[idx];
++        {
++            static int s_gifSrcLog = 0;
++            if (s_gifSrcLog < 24)
++            {
++                ++s_gifSrcLog;
++                std::fprintf(stderr, "[dma-gif] src=0x%x qwc=0x%x chain=%u fromSpr=%d\n", static_cast<unsigned>(p.srcAddr),
++                             static_cast<unsigned>(p.qwc), static_cast<unsigned>(p.chainData.size()), p.fromScratchpad ? 1 : 0);
++            }
++        }
+         if (!p.chainData.empty())
+         {
+             m_seenGifCopy = true;
