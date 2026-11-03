@@ -12,6 +12,7 @@ Nada do jogo e versionado: generated/, build/ e dados/ estao no .gitignore.
 """
 import argparse
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -64,8 +65,11 @@ def montar():
 
 def compilar(tipo):
     bd = os.path.join(RAIZ, "build", "runtime")
+    # o codigo gerado usa SSE4.1 (_mm_blendv_ps etc.); gcc/clang precisam do flag
+    sse = ["-DCMAKE_CXX_FLAGS=-msse4.1", "-DCMAKE_C_FLAGS=-msse4.1"] \
+        if platform.machine().lower() in ("amd64", "x86_64") and "cl" not in os.path.basename(os.environ.get("CXX", "")).lower() else []
     gen = ["-G", "Ninja"] if shutil.which("ninja") else []
-    run(["cmake", "-S", STAGE, "-B", bd, *gen, f"-DCMAKE_BUILD_TYPE={tipo}",
+    run(["cmake", "-S", STAGE, "-B", bd, *gen, f"-DCMAKE_BUILD_TYPE={tipo}", *sse,
          "-DPS2X_BUILD_RECOMP=OFF", "-DPS2X_BUILD_ANALYZER=OFF", "-DPS2X_BUILD_TEST=OFF",
          "-DPS2X_BUILD_STUDIO=OFF", "-DPS2X_ENABLE_DEBUG_UI=OFF"])
     run(["cmake", "--build", bd, "--target", "ps2EntryRunner", "--config", tipo, "-j", str(os.cpu_count() or 2)])
