@@ -20,7 +20,7 @@ Rodado no sandbox (Linux, g++ 13, cmake 3.28) com o PS2Recomp do submódulo (`e5
 - Acessos a hardware (MMIO) detectados, entre outros: DMA (`0x1000A000`, `0x10009000`, `0x1000B400`, `0x1000D400`, `0x1000D480`, `0x1000E010/E020`).
 
 ## Limitações / próximos passos
-1. A análise nativa é menos precisa em ELFs stripped. O export do **Ghidra** deve resolver as tabelas de salto (ver `docs/GHIDRA.md`).
+1. Os ~3,4 mil `jr`/`jalr` indiretos (provavelmente `switch`) seguem sem resolução estática tanto no nativo quanto no export do Ghidra (ver a comparação abaixo e `docs/GHIDRA.md`); o runtime os resolve por `lookupFunction`, a validar no boot.
 2. Os 268 handlers ausentes e os módulos IOP precisam de HLE no runtime (CD por LBA, memory card, pad, SPU2 e `AUDIOPF`).
 3. Compilar e linkar tudo (10.540 unidades) com o runtime e fazer o primeiro boot headless.
 4. Região `0x347670–0x348CC0` (final do `.text`, antes do `.vutext`): vários `jr` indiretos em sequência, provavelmente despacho de funções (a conferir no Ghidra).
