@@ -1,6 +1,8 @@
 # Nada do jogo vai ao GitHub
 dados/
 disc/
+extract/
+extract*/
 *.iso
 *.bin
 *.cue
@@ -9,6 +11,10 @@ disc/
 SLUS_*
 SLES_*
 *.irx
+*.IRX
+*.IMG
+*.PS2
+*.SCP
 *.mcd
 *.ps2
 *.pss
@@ -24,3 +30,8 @@ __pycache__/
 *.pyc
 .vscode/
 .idea/
+
+# Logs e listas locais
+tools/*.log
+lista_iso.txt
+mapa_lba.txt
