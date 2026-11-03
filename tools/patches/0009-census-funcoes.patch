@@ -25,11 +25,11 @@ diff --git a/ps2xRuntime/include/ps2_log.h b/ps2xRuntime/include/ps2_log.h
 +    static int dumps = 0;
 +    std::lock_guard<std::mutex> lock(mtx);
 +    ++counts[name];
-+    if (++total >= 3000000ull && dumps < 8)
++    if (++total >= 200000ull && dumps < 8)
 +    {
 +        std::vector<std::pair<std::string, uint64_t>> v(counts.begin(), counts.end());
 +        std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
-+        std::fprintf(stderr, "[census] dump %d (3M entradas)\n", dumps);
++        std::fprintf(stderr, "[census] dump %d (200k entradas)\n", dumps);
 +        for (size_t i = 0; i < v.size() && i < 40; ++i)
 +            std::fprintf(stderr, "[census] %8llu %s\n", (unsigned long long)v[i].second, v[i].first.c_str());
 +        ++dumps;
