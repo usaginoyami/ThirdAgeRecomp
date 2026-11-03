@@ -4,11 +4,11 @@
 - Estrutura do repositório e push no GitHub.
 - Fase 0: ELF (`docs/ANALISE_ELF.md`), disco (`docs/ISO_LAYOUT.md`), formatos (`docs/FORMATOS.md`).
 - Fase 1 (parcial): PS2Recomp compilado no sandbox; análise nativa + recompilação do ELF inteiro: 10.536 funções, 0 erros, 2.818 avisos de `jr` indireto (`docs/RECOMP_INICIAL.md`). Amostra de 40 arquivos gerados compila (`-fsyntax-only`).
-- Ferramentas: `tools/listar_iso.py`, `tools/extrair_iso.py`, `tools/gerar_recomp.sh`.
+- Census de VU1 (estático): 8 microprogramas carregados por 36 pacotes MPG (7.908 pares); os 36 overlays DVP são só descrições. `docs/VU1_CENSUS.md`, `tools/vu1_census.py`.
+- Ferramentas: `tools/listar_iso.py`, `tools/extrair_iso.py`, `tools/gerar_recomp.sh`, `tools/vu1_census.py`.
 - Ghidra 12.1.4 rodado pelo usuário no ELF (9.207 funções); export em `config/thirdage.ghidra.*` e recompilação com ele: 48.348 arquivos, 356 MB, 0 erros, amostra de 40 compila. Comparação em `docs/RECOMP_INICIAL.md`.
 
 ## Pendente
 - ~3,4 mil `jr` indiretos continuam sem resolução estática (nativo e Ghidra empatam); decidir no boot qual config usar.
 - Compilar e linkar o código gerado com o runtime (ps2xRuntime), que ainda não foi construído.
-- Census de VU1 (`.vutext` + 36 overlays DVP).
 - HLE: CD lendo o ISO por LBA, 268 funções de biblioteca sem handler, módulos IOP, áudio (`AUDIOPF.IRX`).

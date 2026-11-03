@@ -1,0 +1,343 @@
+{
+ "vutext_bytes": 67424,
+ "mpg": 36,
+ "casados": 36,
+ "programas": [
+  {
+   "programa": 0,
+   "id": "3491116187",
+   "pedacos": [
+    [
+     "0xa80",
+     166
+    ]
+   ],
+   "pares": 166,
+   "fim_vu": "0xfb0",
+   "contagem": {
+    "E (fim de programa)": 10,
+    "I (imediato no lower)": 19,
+    "flags (FC*/FS*/FM*)": 2,
+    "SQRT": 1,
+    "RSQRT": 1,
+    "desvio condicional": 1,
+    "WAITQ": 1
+   }
+  },
+  {
+   "programa": 1,
+   "id": "2532780403",
+   "pedacos": [
+    [
+     "0x0",
+     256
+    ],
+    [
+     "0x800",
+     256
+    ],
+    [
+     "0x1000",
+     256
+    ],
+    [
+     "0x1800",
+     256
+    ],
+    [
+     "0x2000",
+     256
+    ],
+    [
+     "0x2800",
+     256
+    ],
+    [
+     "0x3000",
+     256
+    ],
+    [
+     "0x3800",
+     207
+    ]
+   ],
+   "pares": 1999,
+   "fim_vu": "0x3e78",
+   "contagem": {
+    "LQ/ILW (load)": 270,
+    "E (fim de programa)": 18,
+    "I (imediato no lower)": 9,
+    "XTOP": 9,
+    "desvio condicional": 181,
+    "SQ/ISW (store)": 163,
+    "DIV": 36,
+    "XGKICK": 15,
+    "B/BAL": 37,
+    "flags (FC*/FS*/FM*)": 81,
+    "JR/JALR": 6,
+    "WAITQ": 3
+   }
+  },
+  {
+   "programa": 2,
+   "id": "3491151003",
+   "pedacos": [
+    [
+     "0x0",
+     256
+    ],
+    [
+     "0x800",
+     256
+    ],
+    [
+     "0x1000",
+     256
+    ],
+    [
+     "0x1800",
+     256
+    ],
+    [
+     "0x2000",
+     256
+    ],
+    [
+     "0x2800",
+     256
+    ],
+    [
+     "0x3000",
+     146
+    ]
+   ],
+   "pares": 1682,
+   "fim_vu": "0x3490",
+   "contagem": {
+    "LQ/ILW (load)": 224,
+    "E (fim de programa)": 10,
+    "I (imediato no lower)": 27,
+    "XTOP": 5,
+    "desvio condicional": 169,
+    "SQ/ISW (store)": 142,
+    "DIV": 27,
+    "XGKICK": 11,
+    "B/BAL": 35,
+    "flags (FC*/FS*/FM*)": 91,
+    "JR/JALR": 6,
+    "WAITQ": 3
+   }
+  },
+  {
+   "programa": 3,
+   "id": "3491151003",
+   "pedacos": [
+    [
+     "0x0",
+     256
+    ],
+    [
+     "0x800",
+     256
+    ],
+    [
+     "0x1000",
+     256
+    ],
+    [
+     "0x1800",
+     71
+    ]
+   ],
+   "pares": 839,
+   "fim_vu": "0x1a38",
+   "contagem": {
+    "LQ/ILW (load)": 103,
+    "E (fim de programa)": 9,
+    "XTOP": 4,
+    "flags (FC*/FS*/FM*)": 17,
+    "desvio condicional": 32,
+    "B/BAL": 10,
+    "DIV": 8,
+    "WAITQ": 1,
+    "SQ/ISW (store)": 44,
+    "XGKICK": 5,
+    "I (imediato no lower)": 67,
+    "RINIT": 6,
+    "RGET": 7,
+    "RNEXT": 3
+   }
+  },
+  {
+   "programa": 4,
+   "id": "3491151003",
+   "pedacos": [
+    [
+     "0x0",
+     256
+    ],
+    [
+     "0x800",
+     256
+    ],
+    [
+     "0x1000",
+     256
+    ],
+    [
+     "0x1800",
+     256
+    ],
+    [
+     "0x2000",
+     256
+    ],
+    [
+     "0x2800",
+     7
+    ]
+   ],
+   "pares": 1287,
+   "fim_vu": "0x2838",
+   "contagem": {
+    "E (fim de programa)": 9,
+    "LQ/ILW (load)": 312,
+    "XTOP": 2,
+    "SQ/ISW (store)": 144,
+    "XGKICK": 10,
+    "B/BAL": 48,
+    "desvio condicional": 79,
+    "I (imediato no lower)": 19,
+    "EFU (ESIN/EATAN/ERCPR...)": 6,
+    "DIV": 21,
+    "MFP": 8,
+    "flags (FC*/FS*/FM*)": 35,
+    "JR/JALR": 21,
+    "WAITQ": 4
+   }
+  },
+  {
+   "programa": 5,
+   "id": "3491151003",
+   "pedacos": [
+    [
+     "0x0",
+     256
+    ],
+    [
+     "0x800",
+     256
+    ],
+    [
+     "0x1000",
+     256
+    ],
+    [
+     "0x1800",
+     256
+    ],
+    [
+     "0x2000",
+     17
+    ]
+   ],
+   "pares": 1041,
+   "fim_vu": "0x2088",
+   "contagem": {
+    "E (fim de programa)": 8,
+    "B/BAL": 37,
+    "XGKICK": 9,
+    "XTOP": 5,
+    "LQ/ILW (load)": 188,
+    "SQ/ISW (store)": 138,
+    "desvio condicional": 75,
+    "flags (FC*/FS*/FM*)": 33,
+    "DIV": 16,
+    "EFU (ESIN/EATAN/ERCPR...)": 1,
+    "MFP": 1,
+    "JR/JALR": 11,
+    "I (imediato no lower)": 20,
+    "WAITQ": 4
+   }
+  },
+  {
+   "programa": 6,
+   "id": "3491151003",
+   "pedacos": [
+    [
+     "0x0",
+     256
+    ],
+    [
+     "0x800",
+     256
+    ],
+    [
+     "0x1000",
+     52
+    ]
+   ],
+   "pares": 564,
+   "fim_vu": "0x11a0",
+   "contagem": {
+    "E (fim de programa)": 4,
+    "B/BAL": 19,
+    "LQ/ILW (load)": 84,
+    "XTOP": 6,
+    "desvio condicional": 53,
+    "flags (FC*/FS*/FM*)": 37,
+    "DIV": 24,
+    "WAITQ": 6,
+    "I (imediato no lower)": 3,
+    "XGKICK": 4,
+    "SQ/ISW (store)": 37,
+    "JR/JALR": 5
+   }
+  },
+  {
+   "programa": 7,
+   "id": "3491151003",
+   "pedacos": [
+    [
+     "0x0",
+     256
+    ],
+    [
+     "0x800",
+     74
+    ]
+   ],
+   "pares": 330,
+   "fim_vu": "0xa50",
+   "contagem": {
+    "E (fim de programa)": 20,
+    "flags (FC*/FS*/FM*)": 4,
+    "desvio condicional": 7,
+    "RSQRT": 2,
+    "WAITQ": 4,
+    "DIV": 2
+   }
+  }
+ ],
+ "total": {
+  "E (fim de programa)": 88,
+  "I (imediato no lower)": 164,
+  "flags (FC*/FS*/FM*)": 300,
+  "SQRT": 1,
+  "RSQRT": 3,
+  "desvio condicional": 597,
+  "WAITQ": 26,
+  "LQ/ILW (load)": 1181,
+  "XTOP": 31,
+  "SQ/ISW (store)": 668,
+  "DIV": 134,
+  "XGKICK": 54,
+  "B/BAL": 186,
+  "JR/JALR": 49,
+  "RINIT": 6,
+  "RGET": 7,
+  "RNEXT": 3,
+  "EFU (ESIN/EATAN/ERCPR...)": 7,
+  "MFP": 9
+ }
+}
