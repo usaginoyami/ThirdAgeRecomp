@@ -24,3 +24,20 @@ Rodado no sandbox (Linux, g++ 13, cmake 3.28) com o PS2Recomp do submódulo (`e5
 2. Os 268 handlers ausentes e os módulos IOP precisam de HLE no runtime (CD por LBA, memory card, pad, SPU2 e `AUDIOPF`).
 3. Compilar e linkar tudo (10.540 unidades) com o runtime e fazer o primeiro boot headless.
 4. Região `0x347670–0x348CC0` (final do `.text`, antes do `.vutext`): vários `jr` indiretos em sequência, provavelmente despacho de funções (a conferir no Ghidra).
+
+## Comparação: análise nativa × export do Ghidra (2026-11-02)
+Ghidra 12.1.4 + extensão ghidra-emotionengine-reloaded v2.1.38, script `ExportPS2Functions` do PS2Recomp. Configs: `config/thirdage.native.toml` (nativo) e `config/thirdage.toml` (Ghidra + stubs do SDK mesclados; `config/thirdage.ghidra.csv`).
+
+| | Nativo | Ghidra (mesclado) |
+|---|---|---|
+| Funções / pontos de entrada | 10.536 | 9.207 funções + 39.138 rótulos (48.345 registros; 37.205 viram `entry_`) |
+| Arquivos gerados | 10.540 | 48.348 |
+| Tamanho do C++ | 173 MB | 356 MB |
+| Stubs (kernel + SDK) | 102 (SDK) | 146 (44 do kernel do Ghidra + 102 do SDK do nativo, sem conflito de nome) |
+| Sítios de `jr`/`jalr` indireto sem resolver (únicos) | 3.423 | 3.456 |
+| Erros do recompilador | 0 | 0 |
+| Amostra de 40 arquivos (`-fsyntax-only`) | 40/40 | 40/40 |
+
+**Conclusão provisória:** a hipótese de que o Ghidra reduziria os saltos indiretos **não se confirmou**: o recompilador usa só os limites de função e os pontos de entrada do CSV, não as tabelas de salto, então os mesmos ~3,4 mil sítios continuam sem resolução estática. O que o Ghidra acrescenta são limites de função mais confiáveis e 1.861 rótulos `caseD_*` (destinos de `switch`) como pontos de entrada, em troca de dobrar o código gerado. Qual dos dois funciona melhor só se decide no boot (se os `switch` despacham certo pelo `lookupFunction` do runtime). O padrão fica no Ghidra (recomendação do README do PS2Recomp); o nativo fica como alternativa.
+
+O Ghidra não nomeou nenhuma função do SDK Sony (`sceGs*`, `sceCd*`...): o script não usa banco de símbolos. Os 102 nomes vieram do analisador nativo, por assinatura.
