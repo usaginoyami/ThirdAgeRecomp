@@ -1,0 +1,38 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9863999..111f9d3 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -558,9 +558,14 @@ namespace ps2_syscalls
+             heapLimit = kDefaultGuestHeapEnd;
+         }
+ 
++        // Separa o heap do jogo (SetupHeap/EndOfHeap, usado pelo malloc da libc dele) do pool interno do
++        // runtime (PS2Runtime::guestMalloc, usado pelos stubs de GS para montar pacotes). Antes os dois
++        // usavam a mesma faixa e o pacote da GS caia em cima do heap do jogo.
++        static constexpr uint32_t kGameHeapEnd = 0x01C00000u;
++        static constexpr uint32_t kRuntimePoolEnd = 0x01F00000u;
+         if (runtime)
+         {
+-            runtime->configureGuestHeap(heapBase, heapLimit);
++            runtime->configureGuestHeap(kGameHeapEnd, kRuntimePoolEnd);
+ 
+             PS2_IF_AGRESSIVE_LOGS({
+                 std::cerr << "[SetupHeap]"
+@@ -572,7 +577,7 @@ namespace ps2_syscalls
+                           << std::dec << std::endl;
+             });
+ 
+-            setReturnU32(ctx, runtime->guestHeapBase());
++            setReturnU32(ctx, heapBase);
+             return;
+         }
+ 
+@@ -587,7 +592,7 @@ namespace ps2_syscalls
+         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+ 
+         const uint32_t ret = runtime
+-                                 ? runtime->guestHeapLimit()
++                                 ? 0x01C00000u
+                                  : kDefaultGuestHeapEnd;
+ 
+         std::fprintf(stderr, "[EndOfHeap] ret=0x%x base=0x%x end=0x%x\n", ret,
