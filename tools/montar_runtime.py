@@ -89,6 +89,7 @@ def montar():
 
 def compilar(tipo):
     bd = os.path.join(RAIZ, "build", "runtime")
+    limpa_cache_se_mudou(bd)
     # o codigo gerado usa SSE4.1 (_mm_blendv_ps etc.); gcc/clang precisam do flag
     sse = ["-DCMAKE_CXX_FLAGS=-msse4.1", "-DCMAKE_C_FLAGS=-msse4.1"] \
         if platform.machine().lower() in ("amd64", "x86_64") and "cl" not in os.path.basename(os.environ.get("CXX", "")).lower() else []
