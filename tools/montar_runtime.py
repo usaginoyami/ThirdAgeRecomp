@@ -53,7 +53,11 @@ def montar():
         shutil.rmtree(STAGE)
     shutil.copytree(SUB, STAGE, ignore=shutil.ignore_patterns(".git", "build*", "ps2xStudio", "android", "vita"))
     pdir = os.path.join(RAIZ, "tools", "patches")
-    for pf in sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []:
+    if not os.path.isdir(pdir) or not any(f.endswith(".patch") for f in os.listdir(pdir)):
+        sys.exit("ERRO: faltam os patches em tools\\patches\\ (0001-sif-sreg-mailbox.patch). Faca git pull ou copie a pasta.")
+    if "sceSifGetSreg@0x0032A250" not in open(os.path.join(RAIZ, "config", "thirdage.toml")).read():
+        sys.exit("ERRO: config\\thirdage.toml desatualizado (falta sceSifGetSreg@0x0032A250). Faca git pull.")
+    for pf in sorted(os.listdir(pdir)):
         if pf.endswith(".patch"):
             run(["git", "apply", "--whitespace=nowarn", "--directory=build/stage", os.path.join(pdir, pf)], cwd=RAIZ)
     runner = os.path.join(STAGE, "ps2xRuntime", "src", "runner")
