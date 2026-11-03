@@ -13,3 +13,4 @@
 - ~3,4 mil `jr` indiretos continuam sem resolução estática (nativo e Ghidra empatam); decidir no boot qual config usar.
 - Compilar e linkar o código gerado com o runtime (ps2xRuntime), que ainda não foi construído.
 - HLE: CD lendo o ISO por LBA, `sceSifLoadModule`/reboot do IOP (`IOPRP280.IMG`), RPC de `AUDIOPF`/`DS2U_D`, áudio e filmes.
+- Build do runtime: `tools/montar_runtime.py` (+ `Montar_Runtime.bat`) recompila o ELF, monta `build/stage` (cópia do PS2Recomp + código gerado) e compila `ps2EntryRunner`. Etapa de montagem validada no sandbox; o build completo é para o PC Windows (sandbox: 2 núcleos, sem libs X11 do raylib).
