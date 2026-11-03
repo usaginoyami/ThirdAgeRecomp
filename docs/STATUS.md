@@ -2,9 +2,12 @@
 
 ## Feito
 - Estrutura do repositório e push no GitHub.
-- Fase 0 (parcial): ELF `SLUS_210.27` analisado — ver `docs/ANALISE_ELF.md`.
+- Fase 0: ELF `SLUS_210.27` analisado — `docs/ANALISE_ELF.md`.
+- Fase 0: disco listado (156 arquivos, 4,27 GB) — `docs/ISO_LAYOUT.md`.
+- Ferramentas: `tools/listar_iso.py`, `tools/extrair_iso.py` (+ `.bat`).
 
 ## Pendente
-- Listar/extrair o conteúdo do ISO (4,6 GB): a ponte do desktop só leva arquivos de até 400 MB e não há shell no PC. Opção: o usuário roda um script de listagem (ex.: `tools/listar_iso.py`) e envia a saída, ou extrai só `MODULES\`, `Data\Movies` (amostra) e SYSTEM.CNF.
+- Rodar `Extrair_ISO.bat` no PC (extração seletiva, ~150 MB) e analisar o contêiner `.PS2` (2GPM), `IOPRP280.IMG` e os cabeçalhos `.SCP`/`.SAS`.
 - Ghidra: exportar funções para o PS2Recomp.
-- Census de VU1.
+- Census de VU1 (`.vutext` + 36 overlays DVP).
+- Decisão: runtime de CD lendo o ISO direto por LBA.
