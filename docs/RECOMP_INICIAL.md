@@ -8,7 +8,7 @@ Rodado no sandbox (Linux, g++ 13, cmake 3.28) com o PS2Recomp do submódulo (`e5
 | Funções extraídas | 10.536 (10.540 arquivos `.cpp`/`.h` gerados) |
 | Código C++ gerado | ~173 MB |
 | Funções do SDK Sony reconhecidas (stubs) | 102 (ex.: `sceGs*`, `exit`, `__divdi3`) |
-| Funções de biblioteca sem handler no runtime | 268 (a tratar) |
+| Funções sem handler no runtime (recompiladas do código original) | 268 — não são faltas, ver `docs/IOP_MODULOS.md` |
 | Entry point | 0x110008 → `_InitSys`, depois `sub_003287E0` e `sub_001C29C8` |
 | Tempo do recompilador | ~2 s |
 | Erros | 0 |
@@ -21,7 +21,7 @@ Rodado no sandbox (Linux, g++ 13, cmake 3.28) com o PS2Recomp do submódulo (`e5
 
 ## Limitações / próximos passos
 1. Os ~3,4 mil `jr`/`jalr` indiretos (provavelmente `switch`) seguem sem resolução estática tanto no nativo quanto no export do Ghidra (ver a comparação abaixo e `docs/GHIDRA.md`); o runtime os resolve por `lookupFunction`, a validar no boot.
-2. Os 268 handlers ausentes e os módulos IOP precisam de HLE no runtime (CD por LBA, memory card, pad, SPU2 e `AUDIOPF`).
+2. As 268 funções sem handler são código recompilado normal (ver `docs/IOP_MODULOS.md`); o HLE necessário é CD por LBA, carga/reboot do IOP, memory card, pad e áudio (`AUDIOPF`). Os 8 IRX do disco já carregam no ps2xIOP.
 3. Compilar e linkar tudo (10.540 unidades) com o runtime e fazer o primeiro boot headless.
 4. Região `0x347670–0x348CC0` (final do `.text`, antes do `.vutext`): vários `jr` indiretos em sequência, provavelmente despacho de funções (a conferir no Ghidra).
 
