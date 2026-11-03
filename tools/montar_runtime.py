@@ -52,6 +52,10 @@ def montar():
     if os.path.isdir(STAGE):
         shutil.rmtree(STAGE)
     shutil.copytree(SUB, STAGE, ignore=shutil.ignore_patterns(".git", "build*", "ps2xStudio", "android", "vita"))
+    pdir = os.path.join(RAIZ, "tools", "patches")
+    for pf in sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []:
+        if pf.endswith(".patch"):
+            run(["git", "apply", "--whitespace=nowarn", "--directory=build/stage", os.path.join(pdir, pf)], cwd=RAIZ)
     runner = os.path.join(STAGE, "ps2xRuntime", "src", "runner")
     inc = os.path.join(STAGE, "ps2xRuntime", "include")
     os.makedirs(runner, exist_ok=True)

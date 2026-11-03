@@ -110,6 +110,7 @@ stubs = [
   "sceSifDmaStat@0x00328900",
   "sceSifSetDma@0x00328920",
   "isceSifSetDma@0x00328930",
+  "sceSifGetSreg@0x0032A250",
   "sceSifSetDChain@0x00328940",
   "isceSifSetDChain@0x00328950",
   "sceSifSetReg@0x00328960",

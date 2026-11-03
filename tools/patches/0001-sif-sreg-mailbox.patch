@@ -1,0 +1,131 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_sreg.h b/ps2xIOP/include/ps2x/iop/iop_sreg.h
+new file mode 100644
+index 0000000..5030451
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/iop_sreg.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include <cstdint>
++
++namespace ps2x::iop
++{
++    // Mailbox "sregs" of the IOP side of SIF (sceSifGetSreg/SetSreg on the IOP). Written by the EE via
++    // SIF command 0x80000001 (index, value); read by IOP modules through sifcmd import 6.
++    uint32_t iopSifSregGet(uint32_t index);
++    void iopSifSregSet(uint32_t index, uint32_t value);
++}
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..0c93ed2 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -1,3 +1,4 @@
++#include "ps2x/iop/iop_sreg.h"
+ #include "iop_rpc.h"
+ 
+ #include "../core/iop_cpu.h"
+@@ -7,10 +8,21 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
+ #include <cstring>
+ #include <limits>
+ #include <vector>
+ 
++namespace ps2x::iop
++{
++    namespace
++    {
++        uint32_t g_iopSregs[256];
++    }
++    uint32_t iopSifSregGet(uint32_t index) { return g_iopSregs[index & 0xFFu]; }
++    void iopSifSregSet(uint32_t index, uint32_t value) { g_iopSregs[index & 0xFFu] = value; }
++}
++
+ namespace ps2x::iop::detail
+ {
+     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
+@@ -139,13 +151,28 @@ namespace ps2x::iop::detail
+         };
+         switch (ordinal)
+         {
++        case 6: // sceSifGetSreg
++            setV0(iopSifSregGet(cpu.gpr[4]));
++            return true;
++        case 7: // sceSifSetSreg (IOP-local table)
++        {
++            const uint32_t previous = iopSifSregGet(cpu.gpr[4]);
++            iopSifSregSet(cpu.gpr[4], cpu.gpr[5]);
++            setV0(previous);
++            return true;
++        }
++        case 10: // sceSifAddCmdHandler: only logged for now
++            {
++                char line[96];
++                std::snprintf(line, sizeof line, "[IOP] sceSifAddCmdHandler cid=0x%X fn=0x%X", cpu.gpr[4], cpu.gpr[5]);
++                m_host.log(LogLevel::Info, line);
++            }
++            setV0(0);
++            return true;
+         case 4: // InitCmd
+         case 5:
+-        case 6:
+-        case 7:
+         case 8:
+         case 9:
+-        case 10:
+         case 11:
+         case 14: // InitRpc
+         case 15:
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975ed..6787da9 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -235,6 +235,16 @@ namespace ps2_stubs
+         if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
+             return false;
+ 
++        if (commandId == 0x80000001u && packetSize >= 24u)
++        {
++            // System command SET_SREG from the IOP: data = {index, value}
++            uint32_t words[2];
++            std::memcpy(words, static_cast<const uint8_t *>(packet) + 16, sizeof(words));
++            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++            g_sifSregs[words[0]] = words[1];
++            return true;
++        }
++
+         SifCmdHandler registered{};
+         {
+             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..d202798 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -1,3 +1,4 @@
++#include "ps2x/iop/iop_sreg.h"
+ #include "Common.h"
+ #include "RPC.h"
+ #include "../../ps2_iop_transport.h"
+@@ -986,8 +987,20 @@ namespace ps2_syscalls
+             rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
+         }
+ 
++        if (cid == 0x80000001u && packetSize >= 24u)
++        {
++            // System command SET_SREG (EE -> IOP): data = {index, value}
++            uint32_t idx = 0, val = 0;
++            if (const uint8_t *src = getConstMemPtr(rdram, packetAddr + 16u))
++                std::memcpy(&idx, src, sizeof(idx));
++            if (const uint8_t *src = getConstMemPtr(rdram, packetAddr + 20u))
++                std::memcpy(&val, src, sizeof(val));
++            ps2x::iop::iopSifSregSet(idx, val);
++            RUNTIME_LOG("[sceSifSendCmd] SET_SREG(EE->IOP) idx=0x" << std::hex << idx << " val=0x" << val << std::dec << std::endl);
++        }
++
+         static int logCount = 0;
+-        if (logCount < 5)
++        if (logCount < 40)
+         {
+             RUNTIME_LOG("[sceSifSendCmd] cid=0x" << std::hex << cid
+                                                  << " packet=0x" << packetAddr

@@ -112,6 +112,14 @@ public:
         static const char *n[] = {"DEBUG", "INFO", "WARN", "ERROR"};
         if (l >= LogLevel::Warning || verbose) std::cout << "    [" << n[static_cast<int>(l)] << "] " << m << "\n";
     }
+    bool sendSifCommand(uint32_t id, const void *pkt, size_t n) override
+    {
+        const uint32_t *w = static_cast<const uint32_t *>(pkt);
+        std::cout << "    [IOP->EE cmd] cid=0x" << std::hex << id << std::dec << " size=" << n << " data:";
+        for (size_t i = 4; i < n / 4 && i < 12; ++i) std::cout << " 0x" << std::hex << w[i];
+        std::cout << std::dec << "\n";
+        return true;
+    }
     bool verbose = false;
 
 private:
