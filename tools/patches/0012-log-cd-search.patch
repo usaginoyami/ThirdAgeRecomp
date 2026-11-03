@@ -1,0 +1,20 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -602,7 +602,16 @@
+             const std::string guestPath = memory.readString(nameAddress, 1024u);
+             IsoNode *node = findVirtualIsoNode(guestPath);
+             if (!node)
++            {
++                // Cada caminho so uma vez: o AUDIOPF repete a busca em laco quando ela falha.
++                static std::vector<std::string> reported;
++                if (std::find(reported.begin(), reported.end(), guestPath) == reported.end())
++                {
++                    reported.push_back(guestPath);
++                    host.log(LogLevel::Warning, "[IOP] sceCdSearchFile nao achou \"" + guestPath + "\" (raiz: \"" + host.hostPath(HostPathKind::CdRoot) + "\")");
++                }
+                 return false;
++            }
+
+             // sceCdlFILE: lsn, size, name[16], date/flags[8].
+             std::array<uint8_t, 32u> result{};

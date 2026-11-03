@@ -1,0 +1,171 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysclib.cpp b/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
+@@ -3,6 +3,7 @@
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
+ 
++#include <algorithm>
+ #include <cctype>
+ #include <cstdlib>
+ #include <optional>
+@@ -11,6 +12,127 @@
+ 
+ namespace ps2x::iop::detail
+ {
++    namespace
++    {
++        // Formatador do sprintf/vsprintf do IOP. nextArg devolve o proximo argumento de 32 bits do chamador.
++        template <typename NextArg>
++        std::string formatGuest(IopMemory &memory, const std::string &format, NextArg nextArg)
++        {
++            std::string out;
++            for (size_t i = 0; i < format.size(); ++i)
++            {
++                if (format[i] != '%')
++                {
++                    out.push_back(format[i]);
++                    continue;
++                }
++                if (++i >= format.size())
++                    break;
++
++                bool left = false, zero = false, plus = false, space = false, alt = false;
++                for (; i < format.size(); ++i)
++                {
++                    const char flag = format[i];
++                    if (flag == '-') left = true;
++                    else if (flag == '0') zero = true;
++                    else if (flag == '+') plus = true;
++                    else if (flag == ' ') space = true;
++                    else if (flag == '#') alt = true;
++                    else break;
++                }
++                const auto readNumber = [&](size_t &value)
++                {
++                    if (i < format.size() && format[i] == '*')
++                    {
++                        value = nextArg();
++                        ++i;
++                        return;
++                    }
++                    for (; i < format.size() && std::isdigit(static_cast<unsigned char>(format[i])); ++i)
++                        value = value * 10u + static_cast<size_t>(format[i] - '0');
++                };
++                size_t width = 0u, precision = 0u;
++                bool hasPrecision = false;
++                readNumber(width);
++                if (i < format.size() && format[i] == '.')
++                {
++                    hasPrecision = true;
++                    ++i;
++                    readNumber(precision);
++                }
++                while (i < format.size() && (format[i] == 'l' || format[i] == 'h'))
++                    ++i;
++                if (i >= format.size())
++                    break;
++
++                const char conversion = format[i];
++                std::string body;
++                std::string prefix;
++                switch (conversion)
++                {
++                case '%':
++                    out.push_back('%');
++                    continue;
++                case 'c':
++                    body.push_back(static_cast<char>(nextArg()));
++                    break;
++                case 's':
++                {
++                    const uint32_t address = nextArg();
++                    body = address != 0u ? memory.readString(address, 4096u) : std::string("(null)");
++                    if (hasPrecision && body.size() > precision)
++                        body.resize(precision);
++                    break;
++                }
++                case 'd':
++                case 'i':
++                {
++                    const int32_t value = static_cast<int32_t>(nextArg());
++                    const uint32_t magnitude = value < 0 ? 0u - static_cast<uint32_t>(value) : static_cast<uint32_t>(value);
++                    body = std::to_string(magnitude);
++                    prefix = value < 0 ? "-" : (plus ? "+" : (space ? " " : ""));
++                    break;
++                }
++                case 'u':
++                case 'x':
++                case 'X':
++                case 'o':
++                case 'p':
++                {
++                    uint32_t value = nextArg();
++                    const uint32_t base = conversion == 'u' ? 10u : (conversion == 'o' ? 8u : 16u);
++                    const char *digits = conversion == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
++                    if (alt && base == 16u && value != 0u)
++                        prefix = conversion == 'X' ? "0X" : "0x";
++                    do
++                    {
++                        body.insert(body.begin(), digits[value % base]);
++                        value /= base;
++                    } while (value != 0u);
++                    break;
++                }
++                default:
++                    out.push_back('%');
++                    out.push_back(conversion);
++                    continue;
++                }
++
++                const bool numeric = conversion != 's' && conversion != 'c';
++                if (numeric && hasPrecision && body.size() < precision)
++                    body.insert(0u, precision - body.size(), '0');
++                const size_t length = prefix.size() + body.size();
++                const size_t padding = width > length ? width - length : 0u;
++                if (left)
++                    out += prefix + body + std::string(padding, ' ');
++                else if (zero && numeric && !hasPrecision)
++                    out += prefix + std::string(padding, '0') + body;
++                else
++                    out += std::string(padding, ' ') + prefix + body;
++            }
++            return out;
++        }
++    }
++
+     IopSysclib::IopSysclib(IopMemory &memory) noexcept
+         : m_memory(memory)
+     {
+@@ -124,15 +246,26 @@ namespace ps2x::iop::detail
+         case 18: // prnt
+             setV0(0);
+             return true;
+-        case 19: // sprintf: preserve useful literal formats even before full vararg formatting.
+-        case 42: // vsprintf fallback: copy format literal.
++        case 19: // sprintf(buf, fmt, ...): a2/a3 e depois a pilha do chamador (sp+0x10 em diante).
++        case 42: // vsprintf(buf, fmt, va_list): a2 aponta para os argumentos na memoria.
+         {
+             const std::string format = m_memory.readString(a1, 4096u);
+-            for (size_t i = 0; i <= format.size(); ++i)
++            uint32_t registerIndex = ordinal == 19 ? 0u : 2u;
++            uint32_t memoryArgs = ordinal == 19 ? cpu.gpr[29] + 16u : a2;
++            const uint32_t registerArgs[2] = {a2, cpu.gpr[7]};
++            const std::string text = formatGuest(m_memory, format, [&]() -> uint32_t
++            {
++                if (registerIndex < 2u)
++                    return registerArgs[registerIndex++];
++                const uint32_t value = m_memory.read32(memoryArgs);
++                memoryArgs += 4u;
++                return value;
++            });
++            for (size_t i = 0; i <= text.size(); ++i)
+             {
+-                m_memory.write8(a0 + static_cast<uint32_t>(i), i < format.size() ? static_cast<uint8_t>(format[i]) : 0u);
++                m_memory.write8(a0 + static_cast<uint32_t>(i), i < text.size() ? static_cast<uint8_t>(text[i]) : 0u);
+             }
+-            setV0(static_cast<uint32_t>(format.size()));
++            setV0(static_cast<uint32_t>(text.size()));
+             return true;
+         }
+         case 20:

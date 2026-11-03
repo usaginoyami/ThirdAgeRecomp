@@ -1,0 +1,17 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp
+@@ -7,9 +7,10 @@
+     constexpr uint32_t REG_IPU_CTRL = 0x10002010u;
+     constexpr uint32_t REG_IPU_CMD = 0x10002000u;
+     constexpr uint32_t REG_IPU_IN_FIFO = 0x10007010u;
+-    constexpr uint32_t IQVAL_BASE = 0x1721e0u;
+-    constexpr uint32_t VQVAL_BASE = 0x172230u;
+-    constexpr uint32_t SETD4_CHCR_ENTRY = 0x126428u;
++    // Enderecos do SLUS_210.27 (lidos de sceIpuInit em 0x277b58); os originais eram de outro jogo.
++    constexpr uint32_t IQVAL_BASE = 0x37a560u;
++    constexpr uint32_t VQVAL_BASE = 0x37a5b0u;
++    constexpr uint32_t SETD4_CHCR_ENTRY = 0x277ae0u;
+
+     void completeIpuInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
