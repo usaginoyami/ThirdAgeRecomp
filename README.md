@@ -1,4 +1,5 @@
 # ThirdAgeRecomp
+<img width="1448" height="1086" alt="Duck-ai-image-2026-11-03-13-08" src="https://github.com/user-attachments/assets/b6ea5b49-d853-4805-9e8c-5fd71ddbba6d" />
 
 Port nativo de PC de **The Lord of the Rings: The Third Age** (PS2, 2004, EA) por recompilação estática, baseado no [PS2Recomp](https://github.com/ran-j/PS2Recomp).
 
