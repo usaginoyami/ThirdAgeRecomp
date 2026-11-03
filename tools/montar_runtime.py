@@ -28,9 +28,25 @@ def run(cmd, **kw):
     subprocess.run(cmd, check=True, **kw)
 
 
+def limpa_cache_se_mudou(bd):
+    """Se a pasta de build foi copiada de outro lugar, o CMakeCache aponta para o caminho antigo: apaga."""
+    cache = os.path.join(bd, "CMakeCache.txt")
+    if not os.path.exists(cache):
+        return
+    atual = os.path.normcase(os.path.abspath(bd)).replace("\\", "/").lower()
+    for linha in open(cache, encoding="utf-8", errors="replace"):
+        if linha.startswith("CMAKE_CACHEFILE_DIR:"):
+            ant = linha.split("=", 1)[1].strip().replace("\\", "/").lower()
+            if ant != atual:
+                print(f"Cache do CMake de outro caminho ({ant}); apagando {bd}")
+                shutil.rmtree(bd)
+            return
+
+
 def gerar(tipo):
     bd = os.path.join(RAIZ, "build", "ps2recomp")
     gen = ["-G", "Ninja"] if shutil.which("ninja") else []
+    limpa_cache_se_mudou(bd)
     run(["cmake", "-S", SUB, "-B", bd, *gen, f"-DCMAKE_BUILD_TYPE={tipo}",
          "-DPS2X_BUILD_RUNTIME=OFF", "-DPS2X_BUILD_TEST=OFF", "-DPS2X_BUILD_STUDIO=OFF"])
     run(["cmake", "--build", bd, "--target", "ps2_recomp", "--config", tipo, "-j", str(os.cpu_count() or 2)])
