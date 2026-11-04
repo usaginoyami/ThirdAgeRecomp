@@ -1,0 +1,114 @@
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,12 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <sstream>
++#include <string>
++#include <vector>
+ 
+ namespace
+ {
+@@ -119,6 +125,50 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             clearBit(PAD_SELECT);
+     }
+ 
++    // Debug aid: PS2X_PAD_SCRIPT=seg:mascara;... aperta botoes (mascara hexadecimal PAD_*) por 500 ms nesses segundos de execucao.
++    {
++        struct Toque
++        {
++            double inicio = 0.0;
++            uint16_t mascara = 0u;
++            bool avisado = false;
++        };
++        static std::vector<Toque> roteiro = []
++        {
++            std::vector<Toque> saida;
++            if (const char *env = std::getenv("PS2X_PAD_SCRIPT"))
++            {
++                std::istringstream texto(env);
++                std::string item;
++                while (std::getline(texto, item, ';'))
++                {
++                    const size_t sep = item.find(':');
++                    if (sep == std::string::npos)
++                        continue;
++                    Toque toque;
++                    toque.inicio = std::strtod(item.c_str(), nullptr);
++                    toque.mascara = static_cast<uint16_t>(std::strtoul(item.c_str() + sep + 1u, nullptr, 16));
++                    saida.push_back(toque);
++                }
++            }
++            return saida;
++        }();
++        static const auto partida = std::chrono::steady_clock::now();
++        const double agora = std::chrono::duration<double>(std::chrono::steady_clock::now() - partida).count();
++        for (Toque &toque : roteiro)
++        {
++            if (agora >= toque.inicio && agora < toque.inicio + 0.5)
++            {
++                clearBit(toque.mascara);
++                if (!toque.avisado)
++                {
++                    toque.avisado = true;
++                    std::fprintf(stderr, "[pad] toque 0x%04x em %.1f s%c", static_cast<unsigned>(toque.mascara), agora, 10);
++                }
++            }
++        }
++    }
++
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);
+     return true;
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -12,6 +12,8 @@
+ #include <optional>
+ #include <vector>
+ 
++void ps2xAplicarThirdAgePad2(PS2Runtime &runtime); // thirdage_pad2.cpp
++
+ namespace
+ {
+     std::mutex &registryMutex()
+@@ -125,6 +127,10 @@ namespace ps2_game_overrides
+                        uint32_t fileCrc32,
+                        bool fileCrcValid)
+     {
++        if (equalsIgnoreCaseAscii(basenameFromPath(elfPath), "SLUS_210.27"))
++        {
++            ps2xAplicarThirdAgePad2(runtime);
++        }
+ 
+         std::vector<Descriptor> descriptors;
+         {
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -386,6 +386,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
++    src/lib/thirdage_pad2.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1359,6 +1359,9 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+ 
+     if (firstReport)
+     {
++        // Debug aid: PS2X_DESPEJO_NA_QUEDA=1 grava a RAM do guest na primeira chamada para alvo inexistente.
++        if (std::getenv("PS2X_DESPEJO_NA_QUEDA"))
++            std::ofstream("ps2x_queda.raw", std::ios::binary).write(reinterpret_cast<const char *>(rdram), PS2_RAM_SIZE);
+         std::ostringstream oss;
+         oss << "[guest-branch:missing-target] kind=" << describeGuestBranchKind(kind)
+             << " op=" << (debugName ? debugName : "<unknown>")

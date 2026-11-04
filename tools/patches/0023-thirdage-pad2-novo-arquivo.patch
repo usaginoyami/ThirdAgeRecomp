@@ -1,0 +1,107 @@
+diff --git a/ps2xRuntime/src/lib/thirdage_pad2.cpp b/ps2xRuntime/src/lib/thirdage_pad2.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/lib/thirdage_pad2.cpp
+@@ -0,0 +1,102 @@
++// The Third Age (SLUS_210.27) le o controle pela libpad2 (scePad2*, sobre DBCMAN/SIO2). O driver do IOP nao e emulado, entao
++// scePad2LinkDriver falha e, para o jogo, o controle fica desconectado. Aqui as funcoes usadas pelo jogo (0x214f10/0x2153e8)
++// respondem direto a partir do PSPadBackend (teclado, gamepad e PS2X_PAD_SCRIPT). Soquete 0 = porta 1; o soquete 1 fica sem controle.
++#include "ps2_runtime.h"
++#include "runtime/ps2_pad.h"
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++namespace
++{
++    constexpr uint32_t kGuestMask = 0x01FFFFFFu;
++
++    void retorna(R5900Context *ctx, int32_t valor)
++    {
++        setReturnS32(ctx, valor);
++        ctx->pc = getRegU32(ctx, 31);
++    }
++
++    // Estado: 0 = sem controle; 1 = pronto (o jogo so le o controle nesse estado, em 0x215434).
++    void pad2GetState(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        retorna(ctx, getRegU32(ctx, 4) == 0u ? 1 : 0);
++    }
++
++    // Perfil DualShock 2: todos os bits ligados (0x215004 escolhe o modo 4, com pressao).
++    void pad2GetButtonProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
++    {
++        if (getRegU32(ctx, 4) != 0u)
++        {
++            retorna(ctx, -1);
++            return;
++        }
++        std::memset(rdram + (getRegU32(ctx, 5) & kGuestMask), 0xFF, 4u);
++        retorna(ctx, 4);
++    }
++
++    // Copia o relatorio bruto: 2 bytes de botoes (ativos em 0), 4 de analogico e 12 de pressao.
++    void pad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        if (getRegU32(ctx, 4) != 0u)
++        {
++            retorna(ctx, -1);
++            return;
++        }
++        uint8_t estado[32]{};
++        if (!runtime->padBackend().readState(0, 0, estado, sizeof(estado)))
++        {
++            retorna(ctx, -1);
++            return;
++        }
++        uint8_t *destino = rdram + (getRegU32(ctx, 5) & kGuestMask);
++        std::memset(destino, 0, 18u);
++        destino[0] = estado[2];
++        destino[1] = estado[3];
++        std::memcpy(destino + 2, estado + 4, 4u);
++        // Ordem de pressao do DualShock 2: direita, esquerda, cima, baixo, triangulo, circulo, X, quadrado, L1, R1, L2, R2.
++        static const uint8_t kBitDaPressao[12] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 11, 8, 9};
++        const uint16_t botoes = static_cast<uint16_t>(estado[2] | (estado[3] << 8));
++        for (int i = 0; i < 12; ++i)
++            destino[6 + i] = (botoes & (1u << kBitDaPressao[i])) == 0u ? 0xFFu : 0u;
++        retorna(ctx, 18);
++    }
++
++    // libvib: controle sem motores (0 no byte de perfil faz 0x214fa0 pular a vibracao).
++    void vibGetProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
++    {
++        rdram[getRegU32(ctx, 5) & kGuestMask] = 0u;
++        retorna(ctx, 0);
++    }
++
++    void vibSetActParam(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        retorna(ctx, 0);
++    }
++
++    // Indice 0-15: botao, na ordem dos bits do relatorio (1 = apertado). 16-19: analogico. 20-31: pressao.
++    void pad2GetButtonInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
++    {
++        const uint8_t *dados = rdram + (getRegU32(ctx, 5) & kGuestMask);
++        const uint32_t indice = getRegU32(ctx, 6);
++        if (indice < 16u)
++            retorna(ctx, (dados[indice / 8u] & (1u << (indice % 8u))) == 0u ? 1 : 0);
++        else if (indice < 32u)
++            retorna(ctx, dados[2u + (indice - 16u)]);
++        else
++            retorna(ctx, -1);
++    }
++
++}
++
++// Chamada direto por game_overrides.cpp: um registro automatico seria descartado pelo linker, pois a biblioteca e estatica.
++void ps2xAplicarThirdAgePad2(PS2Runtime &runtime)
++{
++    runtime.replaceFunction(0x00278140u, &pad2GetState);
++    runtime.replaceFunction(0x00278070u, &pad2GetButtonProfile);
++    runtime.replaceFunction(0x00277F98u, &pad2Read);
++    runtime.replaceFunction(0x00278280u, &pad2GetButtonInfo);
++    runtime.replaceFunction(0x002858A0u, &vibGetProfile);
++    runtime.replaceFunction(0x00285920u, &vibSetActParam);
++    std::fprintf(stderr, "[pad2] libpad2 ligada ao PSPadBackend%c", 10);
++}
