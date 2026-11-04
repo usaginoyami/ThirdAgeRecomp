@@ -1,0 +1,107 @@
+diff --git a/ps2xRuntime/src/lib/thirdage_gs.cpp b/ps2xRuntime/src/lib/thirdage_gs.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/lib/thirdage_gs.cpp
+@@ -0,0 +1,102 @@
++// The Third Age (SLUS_210.27): o stub sceGsSetDefLoadImage grava uma estrutura propria, mas o jogo (0x1bba6c) manda o pacote direto
++// por DMA e le o tamanho em +0x50. Com o tamanho 0 saia um DIRECT 0 (65536 quadwords), que engolia o resto do fluxo do VIF: texturas
++// viravam comandos GIF, com linhas brancas na tela. Aqui a funcao grava o sceGsLoadImage real, e ExecLoadImage aceita esse formato.
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include "ps2_stubs.h"
++#include <cstdint>
++#include <cstring>
++
++namespace
++{
++    constexpr uint32_t kGuestMask = 0x01FFFFFFu;
++
++    uint32_t quadwordsDaImagem(uint32_t psm, uint32_t largura, uint32_t altura)
++    {
++        const uint32_t pixels = largura * altura;
++        switch (psm)
++        {
++        case 0x00u: case 0x30u: return pixels >> 2u;                 // 32 bits
++        case 0x01u: case 0x31u: return (pixels * 3u) >> 4u;          // 24 bits
++        case 0x02u: case 0x0Au: case 0x32u: case 0x3Au: return pixels >> 3u; // 16 bits
++        case 0x13u: case 0x1Bu: return pixels >> 4u;                 // 8 bits
++        case 0x14u: case 0x24u: case 0x2Cu: return pixels >> 5u;     // 4 bits
++        default: return 0u;
++        }
++    }
++
++    void gravar64(uint8_t *destino, uint32_t deslocamento, uint64_t valor)
++    {
++        std::memcpy(destino + deslocamento, &valor, sizeof(valor));
++    }
++
++    uint32_t arg16(R5900Context *ctx, int reg)
++    {
++        return getRegU32(ctx, reg) & 0xFFFFu;
++    }
++
++    void setDefLoadImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
++    {
++        uint8_t *img = rdram + (getRegU32(ctx, 4) & kGuestMask);
++        const uint64_t bp = arg16(ctx, 5), bw = arg16(ctx, 6), psm = arg16(ctx, 7);
++        const uint64_t x = arg16(ctx, 8), y = arg16(ctx, 9), w = arg16(ctx, 10), h = arg16(ctx, 11);
++        const uint32_t qwc = quadwordsDaImagem(static_cast<uint32_t>(psm), static_cast<uint32_t>(w), static_cast<uint32_t>(h));
++        if (qwc > 0x7FFFu)
++        {
++            setReturnS32(ctx, 0);
++            ctx->pc = getRegU32(ctx, 31);
++            return;
++        }
++        gravar64(img, 0x00u, 0x1000000000008004ull); // GIFtag A+D, NLOOP 4, EOP
++        gravar64(img, 0x08u, 0x0Eull);
++        gravar64(img, 0x10u, (bp << 32u) | (bw << 48u) | (psm << 56u)); // BITBLTBUF
++        gravar64(img, 0x18u, 0x50ull);
++        gravar64(img, 0x20u, (x << 32u) | (y << 48u)); // TRXPOS
++        gravar64(img, 0x28u, 0x51ull);
++        gravar64(img, 0x30u, w | (h << 32u)); // TRXREG
++        gravar64(img, 0x38u, 0x52ull);
++        gravar64(img, 0x40u, 0ull); // TRXDIR
++        gravar64(img, 0x48u, 0x53ull);
++        gravar64(img, 0x50u, static_cast<uint64_t>(qwc) | 0x8000ull | (2ull << 58u)); // GIFtag IMAGE, EOP
++        gravar64(img, 0x58u, 0ull);
++        setReturnS32(ctx, 6);
++        ctx->pc = getRegU32(ctx, 31);
++    }
++
++    // O stub le a estrutura propria: monta ela no lugar por um instante, chama o stub e devolve o pacote real.
++    void execLoadImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t imgAddr = getRegU32(ctx, 4);
++        const uint32_t srcAddr = getRegU32(ctx, 5);
++        const uint32_t ra = getRegU32(ctx, 31);
++        uint8_t *img = rdram + (imgAddr & kGuestMask);
++        uint8_t copia[0x60];
++        std::memcpy(copia, img, sizeof(copia));
++        uint64_t bitblt = 0u, trxpos = 0u, trxreg = 0u;
++        std::memcpy(&bitblt, img + 0x10u, sizeof(bitblt));
++        std::memcpy(&trxpos, img + 0x20u, sizeof(trxpos));
++        std::memcpy(&trxreg, img + 0x30u, sizeof(trxreg));
++
++        R5900Context salvo = *ctx;
++        SET_GPR_U32(ctx, 5, static_cast<uint32_t>((bitblt >> 32u) & 0x3FFFu));
++        SET_GPR_U32(ctx, 6, static_cast<uint32_t>((bitblt >> 48u) & 0x3Fu));
++        SET_GPR_U32(ctx, 7, static_cast<uint32_t>((bitblt >> 56u) & 0x3Fu));
++        SET_GPR_U32(ctx, 8, static_cast<uint32_t>((trxpos >> 32u) & 0x7FFu));
++        SET_GPR_U32(ctx, 9, static_cast<uint32_t>((trxpos >> 48u) & 0x7FFu));
++        SET_GPR_U32(ctx, 10, static_cast<uint32_t>(trxreg & 0xFFFu));
++        SET_GPR_U32(ctx, 11, static_cast<uint32_t>((trxreg >> 32u) & 0xFFFu));
++        ps2_stubs::sceGsSetDefLoadImage(rdram, ctx, runtime);
++        *ctx = salvo;
++        SET_GPR_U32(ctx, 4, imgAddr);
++        SET_GPR_U32(ctx, 5, srcAddr);
++        ps2_stubs::sceGsExecLoadImage(rdram, ctx, runtime);
++        std::memcpy(img, copia, sizeof(copia));
++        ctx->pc = ra;
++    }
++}
++
++void ps2xAplicarThirdAgeGs(PS2Runtime &runtime)
++{
++    runtime.replaceFunction(0x00276588u, &setDefLoadImage);
++    runtime.replaceFunction(0x002768B0u, &execLoadImage);
++}
