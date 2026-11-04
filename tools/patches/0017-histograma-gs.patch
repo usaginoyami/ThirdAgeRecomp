@@ -1,0 +1,121 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -13,6 +13,56 @@ extern std::atomic<uint64_t> g_ps2xStats[8];
+ #include <cstring>
+ #include <iostream>
+ #include <sstream>
++#include <unordered_map>
++
++// Debug aid: PS2X_GS_HIST=N conta primitivas e uploads por estado e imprime o histograma a cada N primitivas.
++namespace
++{
++    std::unordered_map<std::string, uint64_t> g_gsHist;
++    uint64_t g_gsHistTotal = 0u;
++
++    uint32_t gsHistInterval()
++    {
++        static const uint32_t intervalo = []
++        {
++            const char *env = std::getenv("PS2X_GS_HIST");
++            return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 0)) : 0u;
++        }();
++        return intervalo;
++    }
++
++    // Debug aid: PS2X_GS_RING=1 imprime os ultimos registradores escritos antes de sprites do filme (TEX0 com PSM 0x20).
++    struct GsRingEntry
++    {
++        uint8_t reg = 0u;
++        uint64_t value = 0u;
++    };
++    GsRingEntry g_gsRing[64];
++    uint32_t g_gsRingPos = 0u;
++    uint32_t g_gsRingUploads = 0u;
++
++    bool gsRingEnabled()
++    {
++        static const bool ligado = std::getenv("PS2X_GS_RING") != nullptr;
++        return ligado;
++    }
++
++    void gsHistCount(const std::string &chave)
++    {
++        ++g_gsHist[chave];
++    }
++
++    void gsHistFlushIfDue()
++    {
++        if (++g_gsHistTotal < gsHistInterval())
++            return;
++        std::fprintf(stderr, "[gs:hist] inicio%c", 10);
++        for (const auto &item : g_gsHist)
++            std::fprintf(stderr, "[gs:hist] %8llu %s%c", static_cast<unsigned long long>(item.second), item.first.c_str(), 10);
++        g_gsHist.clear();
++        g_gsHistTotal = 0u;
++    }
++}
+ 
+ namespace
+ {
+@@ -1072,6 +1122,11 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ 
+ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+ {
++    if (gsRingEnabled())
++    {
++        g_gsRing[g_gsRingPos % 64u] = {regAddr, value};
++        ++g_gsRingPos;
++    }
+     const bool interestingReg =
+         regAddr == GS_REG_PRIM ||
+         regAddr == GS_REG_RGBAQ ||
+@@ -1383,6 +1438,12 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     {
+         m_trxreg.rrw = static_cast<uint16_t>(value & 0xFFF);
+         m_trxreg.rrh = static_cast<uint16_t>((value >> 32) & 0xFFF);
++        ++g_gsRingUploads;
++        if (gsHistInterval() != 0u)
++        {
++            gsHistCount("upload dbp=" + std::to_string(m_bitbltbuf.dbp) + " dbw=" + std::to_string(m_bitbltbuf.dbw) +
++                        " dpsm=" + std::to_string(m_bitbltbuf.dpsm) + " " + std::to_string(m_trxreg.rrw) + "x" + std::to_string(m_trxreg.rrh));
++        }
+         break;
+     }
+     case GS_REG_TRXDIR:
+@@ -1583,6 +1644,35 @@ void GS::vertexKick(bool drawing)
+     if (drawing && m_backend)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
++        if (gsRingEnabled() && g_gsRingUploads >= 256u)
++        {
++            static int despejos = 0;
++            if (despejos < 6)
++            {
++                ++despejos;
++                g_gsRingUploads = 0u;
++                std::fprintf(stderr, "[gs:anel] sprite tme=%d ctxt=%d prmodecont=%d%c", m_prim.tme ? 1 : 0, m_prim.ctxt ? 1 : 0, m_prmodecont ? 1 : 0, 10);
++                for (uint32_t i = 0u; i < 64u; ++i)
++                {
++                    const GsRingEntry &e = g_gsRing[(g_gsRingPos + i) % 64u];
++                    std::fprintf(stderr, "[gs:anel] reg=0x%02x val=0x%016llx%c", e.reg, static_cast<unsigned long long>(e.value), 10);
++                }
++            }
++        }
++        g_gsRingUploads = 0u;
++        if (gsHistInterval() != 0u)
++        {
++            const GSContext &h = activeContext();
++            std::ostringstream chave;
++            chave << "prim=" << static_cast<int>(m_prim.type) << " tme=" << (m_prim.tme ? 1 : 0) << " abe=" << (m_prim.abe ? 1 : 0)
++                  << " fbp=" << h.frame.fbp << " tbp=" << h.tex0.tbp0 << " tpsm=" << static_cast<int>(h.tex0.psm)
++                  << " tbw=" << static_cast<int>(h.tex0.tbw) << " tw=" << static_cast<int>(h.tex0.tw) << " th=" << static_cast<int>(h.tex0.th)
++                  << " tfx=" << static_cast<int>(h.tex0.tfx) << " alpha=" << std::hex << h.alpha << std::dec
++                  << " c=" << static_cast<int>(m_vtxQueue[0].r) << "," << static_cast<int>(m_vtxQueue[0].g) << ","
++                  << static_cast<int>(m_vtxQueue[0].b) << "," << static_cast<int>(m_vtxQueue[0].a);
++            gsHistCount(chave.str());
++            gsHistFlushIfDue();
++        }
+         // Debug aid: PS2X_GS_SAMPLE=N imprime 1 de cada N primitivas (destino, estado e vertices).
+         static const uint32_t sampleEvery = []
+         {
