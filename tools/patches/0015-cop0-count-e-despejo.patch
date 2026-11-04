@@ -1,0 +1,240 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1600,6 +1600,10 @@ void GS::vertexKick(bool drawing)
+                          static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test),
+                          static_cast<int>(c.scissor.x0), static_cast<int>(c.scissor.y0), static_cast<int>(c.scissor.x1), static_cast<int>(c.scissor.y1),
+                          static_cast<unsigned>(c.xyoffset.ofx), static_cast<unsigned>(c.xyoffset.ofy));
++            std::fprintf(stderr, " tbw=%u tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=0x%x csm=%u csa=%u",
++                         static_cast<unsigned>(c.tex0.tbw), static_cast<unsigned>(c.tex0.tw), static_cast<unsigned>(c.tex0.th),
++                         static_cast<unsigned>(c.tex0.tcc), static_cast<unsigned>(c.tex0.tfx), static_cast<unsigned>(c.tex0.cbp),
++                         static_cast<unsigned>(c.tex0.cpsm), static_cast<unsigned>(c.tex0.csm), static_cast<unsigned>(c.tex0.csa));
+             for (int i = 0; i < needed; ++i)
+             {
+                 const GSVertex &v = m_vtxQueue[i];
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cctype>
++#include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
+ #include <limits>
+@@ -696,6 +697,23 @@ namespace ps2x::iop::detail
+ 
+             if (!read && buildVirtualIso())
+             {
++                // Debug aid: PS2X_CD_TRACE=1 mostra o arquivo de cada leitura e se ela passa do fim dele.
++                static const bool traceCd = std::getenv("PS2X_CD_TRACE") != nullptr;
++                if (traceCd)
++                {
++                    const IsoNode *primeiro = fileForSector(lsn);
++                    std::string linha = "[IOP] sceCdRead lsn=" + std::to_string(lsn) + " setores=" + std::to_string(sectors);
++                    if (primeiro)
++                    {
++                        linha += " arquivo=" + primeiro->identifier + " setorRel=" + std::to_string(lsn - primeiro->lsn) +
++                                 "/" + std::to_string(primeiro->sectors);
++                        if (lsn + sectors > primeiro->lsn + primeiro->sectors)
++                            linha += " PASSA_DO_FIM";
++                    }
++                    else
++                        linha += " sem-arquivo";
++                    host.log(LogLevel::Info, linha);
++                }
+                 read = true;
+                 for (uint32_t sector = 0u; sector < sectors; ++sector)
+                 {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -12,6 +12,8 @@
+ #include "game_overrides.h"
+ #include "ps2_runtime_macros.h"
+ #include "runtime/gs/gs_frontend.h"
++#include "runtime/gs/ps2_gs_psmct32.h"
++#include "runtime/gs/ps2_gs_psmt4.h"
+ #include "runtime/ee_scheduler.h"
+ #include "ThreadNaming.h"
+ #include "Kernel/Stubs/Audio.h"
+@@ -36,6 +38,16 @@
+ 
+ extern std::atomic<uint64_t> g_ps2xStats[8];
+ 
++// COP0 Count do EE (294,912 MHz). O codigo gerado le ctx->cop0_count direto, entao o valor e renovado na entrada de cada
++// funcao e nunca recua: o relogio do jogo (0x1be428) trata um valor menor como volta do contador de 32 bits.
++uint32_t ps2xCop0CountNow()
++{
++    static const auto inicio = std::chrono::steady_clock::now();
++    const auto decorrido = std::chrono::steady_clock::now() - inicio;
++    const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(decorrido).count());
++    return static_cast<uint32_t>((ns / 1000u) * 294912u / 1000u);
++}
++
+ static void ps2xPrintStats()
+ {
+     static uint64_t anteriores[8] = {};
+@@ -50,6 +62,52 @@ static void ps2xPrintStats()
+     std::fputc('\n', stderr);
+ }
+ 
++// Debug aid: PS2X_VRAM_DUMP=tick;tipo:bloco:larguraPaginas:w:h;... grava regioes da VRAM em ps2x_vram_<tipo>_<bloco>.raw
++// no diretorio atual, uma unica vez a partir desse tick. tipo 32 = RGBA de 4 bytes (PSMCT32), tipo 4 = 1 byte por indice (PSMT4).
++static void ps2xMaybeDumpVram(uint64_t tick, const uint8_t *vram)
++{
++    static uint64_t proximo = 0u;
++    const char *env = std::getenv("PS2X_VRAM_DUMP");
++    if (!env || !vram)
++        return;
++    std::istringstream spec(env);
++    std::string item;
++    std::getline(spec, item, ';');
++    if (tick < std::max<uint64_t>(proximo, std::strtoull(item.c_str(), nullptr, 0)))
++        return;
++    // PS2X_VRAM_DUMP_PASSO=N repete o despejo a cada N ticks, em arquivos com o tick no nome.
++    const char *passoEnv = std::getenv("PS2X_VRAM_DUMP_PASSO");
++    const uint64_t passo = passoEnv ? std::strtoull(passoEnv, nullptr, 0) : 0u;
++    if (proximo != 0u && passo == 0u)
++        return;
++    proximo = passo != 0u ? tick + passo : ~0ull;
++    const std::string sufixo = passo != 0u ? "_t" + std::to_string(tick) : std::string();
++    constexpr uint32_t mask = PS2_GS_VRAM_SIZE - 1u;
++    while (std::getline(spec, item, ';'))
++    {
++        unsigned tipo = 0u, bloco = 0u, largura = 0u, w = 0u, h = 0u;
++        if (std::sscanf(item.c_str(), "%u:%u:%u:%u:%u", &tipo, &bloco, &largura, &w, &h) != 5)
++            continue;
++        std::ofstream out("ps2x_vram_" + std::to_string(tipo) + "_" + std::to_string(bloco) + sufixo + ".raw", std::ios::binary);
++        for (uint32_t y = 0u; y < h; ++y)
++        {
++            for (uint32_t x = 0u; x < w; ++x)
++            {
++                if (tipo == 32u)
++                    out.write(reinterpret_cast<const char *>(vram + (GSPSMCT32::addrPSMCT32(bloco, largura, x, y) & mask & ~3u)), 4);
++                else
++                {
++                    const uint32_t nibble = GSPSMT4::addrPSMT4(bloco, largura, x, y);
++                    const uint8_t b = vram[(nibble >> 1u) & mask];
++                    const char indice = static_cast<char>((nibble & 1u) ? (b >> 4u) : (b & 0xFu));
++                    out.write(&indice, 1);
++                }
++            }
++        }
++    }
++    std::fprintf(stderr, "[vram] despejo feito no tick %llu%c", static_cast<unsigned long long>(tick), 10);
++}
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -1374,6 +1432,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      const char *debugName)
+ {
+     ctx->pc = targetPc;
++    ctx->cop0_count = ps2xCop0CountNow();
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+ 
+     // Every inter-function transfer is also a deterministic EE safe point.
+@@ -1452,7 +1511,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     targetFn(rdram, ctx, this);
+     if (traced)
+     {
+-        std::fprintf(stderr, "[ret ] 0x%x -> v0=%x v1=%x\n", targetPc, GPR_U32(ctx, 2), GPR_U32(ctx, 3));
++        // [unw ]: a funcao foi interrompida por um checkpoint do escalonador, nao retornou de verdade.
++        std::fprintf(stderr, "%s 0x%x -> v0=%x v1=%x pc=%x\n", (ctx->pc == fallthroughPc || ctx->pc == entryPc) ? "[ret ]" : "[unw ]",
++                     targetPc, GPR_U32(ctx, 2), GPR_U32(ctx, 3), ctx->pc);
+         // PS2X_TRACE_MEM=0x377dd0,0x35f3f0 : prints these guest words after each traced return.
+         static const std::vector<uint32_t> memAddrs = []
+         {
+@@ -1533,6 +1594,29 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
+                   m_gs, &m_memory,
+                   startPC, 0u, ctx->vu0_itop, 4096);
+     copyVu0StateToContext(m_vu0.state(), ctx);
++    {
++        // Debug aid: PS2X_VU0_TRACE=1 imprime, a cada 200 mil chamadas, as chamadas por programa e onde cada um parou.
++        static const bool traceVu0 = std::getenv("PS2X_VU0_TRACE") != nullptr;
++        if (traceVu0)
++        {
++            static uint32_t chamadas[512] = {};
++            static uint32_t fim[512] = {};
++            static uint32_t total = 0u;
++            const uint32_t indice = (startPC >> 3u) & 0x1FFu;
++            ++chamadas[indice];
++            fim[indice] = m_vu0.state().pc;
++            if ((++total % 200000u) == 1u)
++            {
++                std::fprintf(stderr, "[vu0] total=%u", total);
++                for (uint32_t i = 0u; i < 512u; ++i)
++                {
++                    if (chamadas[i] != 0u)
++                        std::fprintf(stderr, " %u:n=%u,fim=0x%x", i, chamadas[i], fim[i]);
++                }
++                std::fprintf(stderr, "%c", 10);
++            }
++        }
++    }
+ }
+ 
+ void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
+@@ -2507,6 +2591,18 @@ void PS2Runtime::run()
+                                                << " vif=" << curVif
+                                                << std::endl);
+                 ps2xPrintStats();
++                ps2xMaybeDumpVram(tick, m_memory.getGSVRAM());
++                {
++                    static bool vuDespejada = false;
++                    if (!vuDespejada && std::getenv("PS2X_VRAM_DUMP") && tick >= std::strtoull(std::getenv("PS2X_VRAM_DUMP"), nullptr, 0))
++                    {
++                        vuDespejada = true;
++                        std::ofstream("ps2x_vu0_code.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getVU0Code()), PS2_VU0_CODE_SIZE);
++                        std::ofstream("ps2x_vu0_data.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getVU0Data()), PS2_VU0_DATA_SIZE);
++                        std::ofstream("ps2x_vu1_data.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getVU1Data()), PS2_VU1_DATA_SIZE);
++                        std::ofstream("ps2x_rdram.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getRDRAM()), PS2_RAM_SIZE);
++                    }
++                }
+ 
+             }
+         });
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -9,6 +9,8 @@
+ #include <limits>
+ #include <stdexcept>
+ 
++uint32_t ps2xCop0CountNow();
++
+ namespace
+ {
+     constexpr int KE_OK = 0;
+@@ -296,6 +298,7 @@ void EeScheduler::run()
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
++            context.cop0_count = ps2xCop0CountNow();
+             function(m_rdram, &context, &m_runtime);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -561,7 +561,7 @@ namespace ps2_syscalls
+         // Separa o heap do jogo (SetupHeap/EndOfHeap, usado pelo malloc da libc dele) do pool interno do
+         // runtime (PS2Runtime::guestMalloc, usado pelos stubs de GS para montar pacotes). Antes os dois
+         // usavam a mesma faixa e o pacote da GS caia em cima do heap do jogo.
+-        static constexpr uint32_t kGameHeapEnd = 0x01C00000u;
++        static constexpr uint32_t kGameHeapEnd = 0x01E80000u; // 512 KB para o pool do runtime: o jogo enche o heap e o malloc dele falhava com o limite em 0x01C00000
+         static constexpr uint32_t kRuntimePoolEnd = 0x01F00000u;
+         if (runtime)
+         {
+@@ -592,7 +592,7 @@ namespace ps2_syscalls
+         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+ 
+         const uint32_t ret = runtime
+-                                 ? 0x01C00000u
++                                 ? 0x01E80000u
+                                  : kDefaultGuestHeapEnd;
+ 
+         std::fprintf(stderr, "[EndOfHeap] ret=0x%x base=0x%x end=0x%x\n", ret,
