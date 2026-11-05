@@ -1,0 +1,123 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "ps2_vu1_detail.h"
+ 
++#include <optional>
+ #include <algorithm>
+ #include <cfenv>
+ #include <cmath>
+@@ -206,6 +207,14 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+         if ((dest & laneForComponent(component)) == 0u)
+             continue;
+ 
++        // Fora de zero e dos limites, a conta exata so devolveria o sinal: o valor nao muda.
++        const float magnitudeRapida = std::fabs(result[component]);
++        if (magnitudeRapida >= 1.0e-30f && magnitudeRapida <= 1.0e30f)
++        {
++            laneFlags[component] = result[component] < 0.0f ? 0x2u : 0u;
++            continue;
++        }
++
+         long double exactResult = 0.0L;
+         if (calculateFmacExactResult(component, exactResult))
+         {
+@@ -481,6 +490,12 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+         }
+ 
+         float product = left * right;
++        const float produtoRapido = std::fabs(product);
++        if (produtoRapido >= 1.0e-30f && produtoRapido <= 1.0e30f)
++        {
++            extraSticky |= product < 0.0f ? 0x2u : 0u;
++            continue;
++        }
+         const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
+         const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
+         // Product-sum instructions report Z/S/U/O from the add/subtract result
+@@ -1010,15 +1025,21 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+                     ready = std::max(ready, m_vfReady[access.reg][component]);
+             }
+         }
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
++        if ((usage->viRead & ~1u) != 0u)
+         {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
++            for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
++            {
++                if ((usage->viRead & (1u << reg)) != 0u)
++                    ready = std::max(ready, m_viReady[reg]);
++            }
+         }
+-        for (uint32_t component = 0; component < 4u; ++component)
++        if (usage->accRead != 0u)
+         {
+-            if ((usage->accRead & laneForComponent(component)) != 0u)
+-                ready = std::max(ready, m_accReady[component]);
++            for (uint32_t component = 0; component < 4u; ++component)
++            {
++                if ((usage->accRead & laneForComponent(component)) != 0u)
++                    ready = std::max(ready, m_accReady[component]);
++            }
+         }
+     }
+ 
+@@ -1068,15 +1089,21 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+         }
+     }
+ 
+-    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
++    if ((decoded.lowerUsage.viWrite & ~1u) != 0u)
+     {
+-        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
++        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
++        {
++            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
++                m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
++        }
+     }
+-    for (uint32_t component = 0; component < 4u; ++component)
++    if (decoded.upperUsage.accWrite != 0u)
+     {
+-        if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
+-            m_accReady[component] = m_cycle + kAccForwardLatency;
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
++                m_accReady[component] = m_cycle + kAccForwardLatency;
++        }
+     }
+ }
+ 
+@@ -1644,7 +1671,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
+-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
++        // Caminho comum: referencia direta ao cache, sem copiar a estrutura. A geracao e conferida abaixo, como em getDecodedInstructionPairForPc.
++        const uint32_t paresPc = m_state.pc;
++        const bool cacheDireto = (paresPc & 7u) == 0u && m_decodedCodeCacheValid && memory != nullptr &&
++                                 m_cachedVuCode == vuCode && m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
++                                 paresPc / 8u < kMaxDecodedPairs &&
++                                 ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code() && m_cachedCodeGeneration == memory->getVU1CodeGeneration()) ||
++                                  (m_unit == Unit::VU0 && vuCode == memory->getVU0Code() && m_cachedCodeGeneration == memory->getVU0CodeGeneration()));
++        std::optional<DecodedInstructionPair> decodedCopia;
++        if (!cacheDireto)
++            decodedCopia = getDecodedInstructionPairForPc(vuCode, codeSize, memory, paresPc);
++        const DecodedInstructionPair &decoded = cacheDireto ? m_decodedCodeCache[paresPc / 8u] : *decodedCopia;
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+@@ -1667,7 +1704,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+         uint8_t writtenVi = 0u;
+         int32_t oldVi = 0;
+-        for (uint32_t reg = 1; reg < 16u; ++reg)
++        for (uint32_t reg = 1; reg < 16u && (decoded.lowerUsage.viWrite & ~1u) != 0u; ++reg)
+         {
+             if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+             {

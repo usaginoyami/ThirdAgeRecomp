@@ -1,0 +1,30 @@
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -14,6 +14,7 @@
+ 
+ void ps2xAplicarThirdAgePad2(PS2Runtime &runtime); // thirdage_pad2.cpp
+ void ps2xAplicarThirdAgeGs(PS2Runtime &runtime);   // thirdage_gs.cpp
++void ps2xIniciarPerfil();                          // thirdage_perfil.cpp
+ 
+ namespace
+ {
+@@ -132,6 +133,7 @@ namespace ps2_game_overrides
+         {
+             ps2xAplicarThirdAgePad2(runtime);
+             ps2xAplicarThirdAgeGs(runtime);
++            ps2xIniciarPerfil();
+         }
+ 
+         std::vector<Descriptor> descriptors;
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -388,6 +388,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_pad.cpp
+     src/lib/thirdage_pad2.cpp
+     src/lib/thirdage_gs.cpp
++    src/lib/thirdage_perfil.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp

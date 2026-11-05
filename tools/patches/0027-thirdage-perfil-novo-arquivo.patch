@@ -1,0 +1,109 @@
+diff --git a/ps2xRuntime/src/lib/thirdage_perfil.cpp b/ps2xRuntime/src/lib/thirdage_perfil.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/lib/thirdage_perfil.cpp
+@@ -0,0 +1,104 @@
++// Debug aid: PS2X_PERFIL=segundos amostra, a partir desse instante, o RIP das threads a cada ~2 ms e regrava ps2x_perfil.txt a cada 20 s:
++// base da imagem, amostras por thread dentro e fora do .exe, por DLL e por endereco (thread << 40 | RVA, grao de 16 bytes). Sem efeito se a variavel faltar.
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <string>
++#include <thread>
++#include <chrono>
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <psapi.h>
++#include <tlhelp32.h>
++#endif
++
++void ps2xIniciarPerfil()
++{
++#ifdef _WIN32
++    const char *env = std::getenv("PS2X_PERFIL");
++    if (!env)
++        return;
++    const int atraso = std::atoi(env);
++    std::thread([atraso]
++    {
++        std::this_thread::sleep_for(std::chrono::seconds(atraso));
++        HMODULE modulo = GetModuleHandleW(nullptr);
++        MODULEINFO info{};
++        GetModuleInformation(GetCurrentProcess(), modulo, &info, sizeof(info));
++        const uint64_t base = reinterpret_cast<uint64_t>(info.lpBaseOfDll);
++        const uint64_t fim = base + info.SizeOfImage;
++        const DWORD pid = GetCurrentProcessId(), eu = GetCurrentThreadId();
++        std::map<uint64_t, uint64_t> contagem;
++        std::map<DWORD, uint64_t> porThread;
++        auto ultimo = std::chrono::steady_clock::now();
++        uint64_t total = 0u;
++        std::map<std::string, uint64_t> foraDoExe;
++        std::map<DWORD, uint64_t> porThreadFora;
++        for (;;)
++        {
++            HANDLE lista = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++            THREADENTRY32 te{};
++            te.dwSize = sizeof(te);
++            if (Thread32First(lista, &te))
++            {
++                do
++                {
++                    if (te.th32OwnerProcessID != pid || te.th32ThreadID == eu)
++                        continue;
++                    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
++                    if (!t)
++                        continue;
++                    if (SuspendThread(t) != static_cast<DWORD>(-1))
++                    {
++                        CONTEXT c{};
++                        c.ContextFlags = CONTEXT_CONTROL;
++                        if (GetThreadContext(t, &c))
++                        {
++                            if (c.Rip >= base && c.Rip < fim)
++                            {
++                                ++contagem[(static_cast<uint64_t>(te.th32ThreadID) << 40u) | ((c.Rip - base) & ~15ull)];
++                                ++porThread[te.th32ThreadID];
++                                ++total;
++                            }
++                            else
++                            {
++                                // Fora do .exe: conta por DLL, so na thread mais ocupada (as outras passam o tempo esperando no sistema).
++                                HMODULE m = nullptr;
++                                char nome[MAX_PATH] = "?";
++                                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(c.Rip), &m) && m)
++                                    GetModuleBaseNameA(GetCurrentProcess(), m, nome, sizeof(nome));
++                                ++foraDoExe[nome];
++                                ++porThreadFora[te.th32ThreadID];
++                            }
++                        }
++                        ResumeThread(t);
++                    }
++                    CloseHandle(t);
++                } while (Thread32Next(lista, &te));
++            }
++            CloseHandle(lista);
++            std::this_thread::sleep_for(std::chrono::milliseconds(2));
++            const auto agora = std::chrono::steady_clock::now();
++            if (agora - ultimo > std::chrono::seconds(20))
++            {
++                ultimo = agora;
++                if (std::FILE *f = std::fopen("ps2x_perfil.txt", "w"))
++                {
++                    std::fprintf(f, "base %llx total %llu\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(total));
++                    for (const auto &p : porThread)
++                        std::fprintf(f, "thread %lu %llu\n", static_cast<unsigned long>(p.first), static_cast<unsigned long long>(p.second));
++                    for (const auto &p : foraDoExe)
++                        std::fprintf(f, "fora %s %llu%c", p.first.c_str(), static_cast<unsigned long long>(p.second), 10);
++                    for (const auto &p : porThreadFora)
++                        std::fprintf(f, "thread_fora %lu %llu%c", static_cast<unsigned long>(p.first), static_cast<unsigned long long>(p.second), 10);
++                    for (const auto &p : contagem)
++                        std::fprintf(f, "%llx %llu\n", static_cast<unsigned long long>(p.first), static_cast<unsigned long long>(p.second));
++                    std::fclose(f);
++                }
++            }
++        }
++    }).detach();
++#endif
++}
