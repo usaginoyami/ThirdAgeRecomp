@@ -1,0 +1,109 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -85,6 +85,9 @@ namespace
+     }
+ }
+ 
++// Quadwords que ainda faltam do DIRECT em curso, quando ele traz dados de uma imagem do GIF.
++uint32_t s_vif1DirectQwRestante = 0u;
++
+ void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
+@@ -309,7 +312,41 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ 
+     while (pos + 4 <= sizeBytes)
+     {
+-        if (m_vif1PendingPath2ImageQwc != 0u)
++        // Imagem do GIF iniciada por um DIRECT: so os dados de um DIRECT vao para o GIF. Entre um DIRECT e outro ha VIFcodes,
++        // que nao podem virar pixels (o Third Age manda a tag em DIRECT 1 e os dados em um REF com TTE: NOP, DIRECT 0x40).
++        if (m_vif1PendingPath2ImageQwc != 0u && s_vif1DirectQwRestante == 0u)
++        {
++            uint32_t proximo = 0u;
++            std::memcpy(&proximo, data + pos, sizeof(proximo));
++            const uint8_t proximoOp = static_cast<uint8_t>((proximo >> 24) & 0x7Fu);
++            if (proximoOp == VIF_NOP)
++            {
++                pos += 4u;
++                continue;
++            }
++            if (proximoOp == VIF_DIRECT || proximoOp == VIF_DIRECTHL)
++            {
++                const uint32_t qw = proximo & 0xFFFFu;
++                s_vif1DirectQwRestante = qw != 0u ? qw : 65536u;
++                pos += 4u;
++                continue;
++            }
++        }
++        else if (m_vif1PendingPath2ImageQwc == 0u && s_vif1DirectQwRestante != 0u)
++        {
++            // O DIRECT tinha mais que a imagem: o resto sao pacotes GIF normais.
++            const uint32_t restoQw = std::min<uint32_t>(s_vif1DirectQwRestante, (sizeBytes - pos) / 16u);
++            if (restoQw == 0u)
++            {
++                break;
++            }
++            submitGifPacket(GifPathId::Path2, data + pos, restoQw * 16u, true, false);
++            pos += restoQw * 16u;
++            s_vif1DirectQwRestante -= restoQw;
++            continue;
++        }
++
++        if (m_vif1PendingPath2ImageQwc != 0u && s_vif1DirectQwRestante != 0u)
+         {
+             const uint32_t availableQw = (sizeBytes - pos) / 16u;
+             if (availableQw == 0u)
+@@ -317,7 +354,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 break;
+             }
+ 
+-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
++            const uint32_t chunkQw = std::min<uint32_t>(std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw), s_vif1DirectQwRestante);
+             std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+             const uint64_t imageTag =
+                 static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+@@ -328,6 +365,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+ 
+             pos += chunkQw * 16u;
++            s_vif1DirectQwRestante -= chunkQw;
+             m_vif1PendingPath2ImageQwc -= chunkQw;
+             if (m_vif1PendingPath2ImageQwc == 0u)
+             {
+@@ -513,6 +551,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 {
+                     m_vif1PendingPath2ImageQwc = pendingImageQw;
+                     m_vif1PendingPath2DirectHl = directHl;
++                    s_vif1DirectQwRestante = truncated ? (imm != 0u ? imm : 65536u) - qwCount : 0u;
+                 }
+             }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -11,6 +11,8 @@
+ #include <string>
+ #include <vector>
+ 
++extern uint32_t s_vif1DirectQwRestante; // ps2_vif1_interpreter.cpp
++
+ namespace
+ {
+     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
+@@ -331,6 +333,7 @@ bool PS2Memory::initialize(size_t ramSize)
+     m_path3Masked = false;
+     m_path3MaskedFifo.clear();
+     m_vif1PendingPath2ImageQwc = 0u;
++    s_vif1DirectQwRestante = 0u;
+     m_vif1PendingPath2DirectHl = false;
+     resetEeTimers();
+ 
+@@ -1231,6 +1234,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 const bool wasPath3Masked = m_path3Masked;
+                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+                 m_vif1PendingPath2ImageQwc = 0u;
++                s_vif1DirectQwRestante = 0u;
+                 m_vif1PendingPath2DirectHl = false;
+                 m_path3Masked = false;
+                 if (wasPath3Masked)

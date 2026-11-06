@@ -1,0 +1,212 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -32,6 +32,27 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // Estado do PS2X_GS_SEQ (ver GS::...): grupo de primitivas iguais ainda nao impresso.
++    uint32_t g_seqConta = 0u, g_seqRepete = 0u, g_seqZbp = 0u;
++    uint64_t g_seqChave = 0u, g_seqAlpha = 0u, g_seqTexa = 0u;
++    GSVertex g_seqV0{}, g_seqV1{};
++    bool g_seqAberta = false;
++
++    void gsSeqDescarrega()
++    {
++        if (g_seqRepete == 0u)
++            return;
++        std::fprintf(stderr, "[gs:seq] %6u prim=%u tme=%u abe=%u fst=%u fbp=%u msk=%02x zbp=%u tbp=%u tpsm=0x%x alpha=0x%llx texa=0x%llx rgba=%u,%u,%u,%u v0=(%.1f,%.1f uv=%u,%u st=%.3f,%.3f) v1=(%.1f,%.1f uv=%u,%u)%c",
++                     g_seqRepete, static_cast<unsigned>(g_seqChave & 0xFu), static_cast<unsigned>((g_seqChave >> 4) & 1u), static_cast<unsigned>((g_seqChave >> 5) & 1u), static_cast<unsigned>((g_seqChave >> 6) & 1u),
++                     static_cast<unsigned>((g_seqChave >> 8) & 0xFFFu), static_cast<unsigned>(g_seqChave >> 44), g_seqZbp, static_cast<unsigned>((g_seqChave >> 20) & 0xFFFFu), static_cast<unsigned>((g_seqChave >> 36) & 0xFFu),
++                     static_cast<unsigned long long>(g_seqAlpha), static_cast<unsigned long long>(g_seqTexa), g_seqV0.r, g_seqV0.g, g_seqV0.b, g_seqV0.a,
++                     g_seqV0.x, g_seqV0.y, static_cast<unsigned>(g_seqV0.u), static_cast<unsigned>(g_seqV0.v), g_seqV0.s, g_seqV0.t, g_seqV1.x, g_seqV1.y, static_cast<unsigned>(g_seqV1.u), static_cast<unsigned>(g_seqV1.v), 10);
++        g_seqRepete = 0u;
++    }
++}
++
+ // Debug aid: PS2X_GS_HIST=N conta primitivas e uploads por estado e imprime o histograma a cada N primitivas.
+ namespace
+ {
+@@ -1410,6 +1431,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     case GS_REG_FRAME_2:
+     {
+         int ci = (regAddr == GS_REG_FRAME_2) ? 1 : 0;
++        if (g_seqAberta)
++        {
++            gsSeqDescarrega();
++            std::fprintf(stderr, "[gs:seq] FRAME_%d=0x%llx ctxt=%u%c", ci + 1, static_cast<unsigned long long>(value), static_cast<unsigned>(m_prim.ctxt), 10);
++        }
+         m_ctx[ci].frame.fbp = static_cast<uint32_t>(value & 0x1FF);
+         m_ctx[ci].frame.fbw = static_cast<uint32_t>((value >> 16) & 0x3F);
+         m_ctx[ci].frame.psm = static_cast<uint8_t>((value >> 24) & 0x3F);
+@@ -1420,6 +1446,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     case GS_REG_ZBUF_2:
+     {
+         int ci = (regAddr == GS_REG_ZBUF_2) ? 1 : 0;
++        if (g_seqAberta)
++        {
++            gsSeqDescarrega();
++            std::fprintf(stderr, "[gs:seq] ZBUF_%d=0x%llx ctxt=%u%c", ci + 1, static_cast<unsigned long long>(value), static_cast<unsigned>(m_prim.ctxt), 10);
++        }
+         m_ctx[ci].zbuf.zbp = value & 0x1FF;
+         m_ctx[ci].zbuf.psm = ((value >> 24) & 0xF) | 0x30;
+         m_ctx[ci].zbuf.zmask = (value >> 32) & 1;
+@@ -1466,6 +1497,12 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     case GS_REG_TRXDIR:
+     {
+         m_trxdir = static_cast<uint32_t>(value & 0x3);
++        if (g_seqAberta)
++        {
++            gsSeqDescarrega();
++            std::fprintf(stderr, "[gs:seq] transf dir=%u dbp=%u dbw=%u dpsm=0x%x dst=%u,%u tam=%ux%u%c", m_trxdir, static_cast<unsigned>(m_bitbltbuf.dbp), static_cast<unsigned>(m_bitbltbuf.dbw),
++                         static_cast<unsigned>(m_bitbltbuf.dpsm), static_cast<unsigned>(m_trxpos.dsax), static_cast<unsigned>(m_trxpos.dsay), static_cast<unsigned>(m_trxreg.rrw), static_cast<unsigned>(m_trxreg.rrh), 10);
++        }
+ 
+         if (m_backend)
+         {
+@@ -1690,6 +1727,72 @@ void GS::vertexKick(bool drawing)
+             gsHistCount(chave.str());
+             gsHistFlushIfDue();
+         }
++        // Debug aid: PS2X_GS_TEXDUMP=periodo:quantos grava, a cada `periodo` primitivas, as texturas das `quantos` primeiras
++        // primitivas com textura que nao sejam SPRITE: tex_<n>.rgba (largura*altura*4, ja com a paleta) e uma linha no stderr.
++        {
++            static const uint32_t tdPeriodo = []
++            {
++                const char *env = std::getenv("PS2X_GS_TEXDUMP");
++                return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 0)) : 0u;
++            }();
++            static const uint32_t tdQuantos = []
++            {
++                const char *env = std::getenv("PS2X_GS_TEXDUMP");
++                const char *sep = env ? std::strchr(env, ':') : nullptr;
++                return sep ? static_cast<uint32_t>(std::strtoul(sep + 1, nullptr, 0)) : 0u;
++            }();
++            static uint32_t tdConta = 0u, tdRestam = 0u, tdN = 0u;
++            if (tdPeriodo != 0u && (++tdConta % tdPeriodo) == 0u)
++                tdRestam = tdQuantos;
++            if (tdRestam != 0u && m_prim.tme && m_prim.type != GS_PRIM_SPRITE && m_backend)
++            {
++                --tdRestam;
++                const GSContext &c = activeContext();
++                const uint32_t w = 1u << std::min<uint32_t>(c.tex0.tw, 10u), h = 1u << std::min<uint32_t>(c.tex0.th, 10u);
++                const uint32_t psm = c.tex0.psm;
++                m_backend->Flush();
++                const bool t8 = psm == 0x13u || psm == 0x1Bu, t4 = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
++                std::vector<uint32_t> pal;
++                uint32_t palMaxRgb = 0u, palMaxA = 0u;
++                if (t8 || t4)
++                {
++                    const uint32_t n = t8 ? 256u : 16u;
++                    pal.resize(n);
++                    for (uint32_t i = 0u; i < n; ++i)
++                    {
++                        const uint32_t k = t8 ? ((i & 0xE7u) | ((i & 8u) << 1u) | ((i & 16u) >> 1u)) : i;
++                        const uint32_t cor = m_backend->ReadVram(c.tex0.cpsm, c.tex0.cbp, 1u, k & (t8 ? 15u : 7u), t8 ? (k >> 4u) : (k >> 3u));
++                        pal[i] = cor;
++                        palMaxRgb = std::max({palMaxRgb, cor & 0xFFu, (cor >> 8u) & 0xFFu, (cor >> 16u) & 0xFFu});
++                        palMaxA = std::max(palMaxA, cor >> 24u);
++                    }
++                }
++                char nome[64];
++                std::snprintf(nome, sizeof(nome), "tex_%04u.rgba", tdN);
++                std::FILE *f = std::fopen(nome, "wb");
++                uint32_t naoNulos = 0u;
++                for (uint32_t y = 0u; f && y < h; ++y)
++                {
++                    for (uint32_t x = 0u; x < w; ++x)
++                    {
++                        uint32_t v = m_backend->ReadVram(psm, c.tex0.tbp0, c.tex0.tbw, x, y);
++                        if (v != 0u)
++                            ++naoNulos;
++                        if (!pal.empty())
++                            v = pal[v & static_cast<uint32_t>(pal.size() - 1u)];
++                        std::fwrite(&v, 4u, 1u, f);
++                    }
++                }
++                if (f)
++                    std::fclose(f);
++                std::fprintf(stderr, "[gs:tex] %s %ux%u prim=%d fbp=%u tbp=%u tbw=%u psm=0x%x cbp=%u cpsm=0x%x csa=%u tcc=%u tfx=%u alpha=0x%llx naoNulos=%u palRgb=%u palA=%u cor=%u,%u,%u,%u v0=(%.1f,%.1f st=%.3f,%.3f q=%.3f)%c",
++                             nome, w, h, static_cast<int>(m_prim.type), static_cast<unsigned>(c.frame.fbp), static_cast<unsigned>(c.tex0.tbp0), static_cast<unsigned>(c.tex0.tbw), psm,
++                             static_cast<unsigned>(c.tex0.cbp), static_cast<unsigned>(c.tex0.cpsm), static_cast<unsigned>(c.tex0.csa), static_cast<unsigned>(c.tex0.tcc), static_cast<unsigned>(c.tex0.tfx),
++                             static_cast<unsigned long long>(c.alpha), naoNulos, palMaxRgb, palMaxA, m_vtxQueue[0].r, m_vtxQueue[0].g, m_vtxQueue[0].b, m_vtxQueue[0].a,
++                             m_vtxQueue[0].x, m_vtxQueue[0].y, m_vtxQueue[0].s, m_vtxQueue[0].t, m_vtxQueue[0].q, 10);
++                ++tdN;
++            }
++        }
+         // Debug aid: PS2X_GS_SEQ=periodo:janela imprime, a cada `periodo` primitivas, as `janela` seguintes em sequencia
+         // comprimida (mesmo estado = uma linha com a contagem). Mostra a ordem de desenho sem o custo do histograma.
+         {
+@@ -1706,38 +1809,33 @@ void GS::vertexKick(bool drawing)
+             }();
+             if (seqPeriodo != 0u)
+             {
+-                static uint32_t seqConta = 0u, seqRepete = 0u;
+-                static uint64_t seqChave = 0u, seqAlpha = 0u, seqTexa = 0u;
+-                static GSVertex seqV0{}, seqV1{};
+-                static uint32_t seqR = 0u;
+-                const uint32_t pos = seqConta++ % seqPeriodo;
+-                if (pos < seqJanela)
++                const uint32_t pos = g_seqConta++ % seqPeriodo;
++                g_seqAberta = pos < seqJanela;
++                if (g_seqAberta)
+                 {
+                     const GSContext &c = activeContext();
+                     const uint64_t chave = static_cast<uint64_t>(m_prim.type) | (static_cast<uint64_t>(m_prim.tme) << 4) | (static_cast<uint64_t>(m_prim.abe) << 5) |
+                                            (static_cast<uint64_t>(m_prim.fst) << 6) | (static_cast<uint64_t>(c.frame.fbp) << 8) |
+                                            (static_cast<uint64_t>(c.tex0.tbp0) << 20) | (static_cast<uint64_t>(c.tex0.psm) << 36) |
+                                            (static_cast<uint64_t>(c.frame.fbmsk >> 24) << 44);
+-                    if (pos == 0u || chave != seqChave || c.alpha != seqAlpha)
++                    if (pos == 0u || chave != g_seqChave || c.alpha != g_seqAlpha)
+                     {
+-                        if (seqRepete != 0u)
+-                            std::fprintf(stderr, "[gs:seq] %6u prim=%u tme=%u abe=%u fst=%u fbp=%u msk=%02x tbp=%u tpsm=0x%x alpha=0x%llx texa=0x%llx rgba=%u,%u,%u,%u v0=(%.1f,%.1f uv=%u,%u st=%.3f,%.3f) v1=(%.1f,%.1f uv=%u,%u)%c",
+-                                         seqRepete, static_cast<unsigned>(seqChave & 0xFu), static_cast<unsigned>((seqChave >> 4) & 1u), static_cast<unsigned>((seqChave >> 5) & 1u), static_cast<unsigned>((seqChave >> 6) & 1u),
+-                                         static_cast<unsigned>((seqChave >> 8) & 0xFFFu), static_cast<unsigned>(seqChave >> 44), static_cast<unsigned>((seqChave >> 20) & 0xFFFFu), static_cast<unsigned>((seqChave >> 36) & 0xFFu),
+-                                         static_cast<unsigned long long>(seqAlpha), static_cast<unsigned long long>(seqTexa), seqV0.r, seqV0.g, seqV0.b, seqV0.a,
+-                                         seqV0.x, seqV0.y, static_cast<unsigned>(seqV0.u), static_cast<unsigned>(seqV0.v), seqV0.s, seqV0.t, seqV1.x, seqV1.y, static_cast<unsigned>(seqV1.u), static_cast<unsigned>(seqV1.v), 10);
++                        gsSeqDescarrega();
+                         if (pos == 0u)
+                             std::fprintf(stderr, "[gs:seq] ---- janela%c", 10);
+-                        seqRepete = 0u;
+-                        seqChave = chave;
+-                        seqAlpha = c.alpha;
+-                        seqTexa = (static_cast<uint64_t>(m_texa.ta0) << 0) | (static_cast<uint64_t>(m_texa.aem) << 8) | (static_cast<uint64_t>(m_texa.ta1) << 16);
+-                        seqV0 = m_vtxQueue[0];
+-                        seqV1 = m_vtxQueue[needed > 1 ? 1 : 0];
++                        g_seqChave = chave;
++                        g_seqAlpha = c.alpha;
++                        g_seqZbp = c.zbuf.zbp;
++                        g_seqTexa = (static_cast<uint64_t>(m_texa.ta0) << 0) | (static_cast<uint64_t>(m_texa.aem) << 8) | (static_cast<uint64_t>(m_texa.ta1) << 16);
++                        g_seqV0 = m_vtxQueue[0];
++                        g_seqV1 = m_vtxQueue[needed > 1 ? 1 : 0];
+                     }
+-                    ++seqRepete;
++                    ++g_seqRepete;
++                }
++                else
++                {
++                    gsSeqDescarrega();
+                 }
+-                (void)seqR;
+             }
+         }
+         // Debug aid: PS2X_GS_SAMPLE=N imprime 1 de cada N primitivas (destino, estado e vertices).
+@@ -1769,7 +1867,14 @@ void GS::vertexKick(bool drawing)
+             std::fprintf(stderr, "%c", 10);
+         }
+         updatePreferredDisplaySourceForDraw(batch);
+-        m_backend->Submit(batch);
++        // Third Age: a sombra por mascara (0x21aa88) tem o buffer fixo em FBP 384 (bloco 0x3000), que e tambem o inicio do conjunto
++        // de texturas, e apaga as residentes (o logo do menu). Enquanto nao se sabe por que isso nao ocorre no console, descarta a
++        // mascara e o escurecimento que a le (textura no bloco 0x3000, ALPHA 0x46). PS2X_COM_SOMBRA=1 mantem o desenho original.
++        static const bool comSombra = std::getenv("PS2X_COM_SOMBRA") != nullptr;
++        const GSContext &ctxDesenho = activeContext();
++        const bool desenhoDaSombra = ctxDesenho.frame.fbp == 384u || (m_prim.tme && ctxDesenho.tex0.tbp0 == 0x3000u && ctxDesenho.alpha == 0x46u);
++        if (comSombra || !desenhoDaSombra)
++            m_backend->Submit(batch);
+         recordDrawDebugEventUnlocked(needed);
+     }
+ 

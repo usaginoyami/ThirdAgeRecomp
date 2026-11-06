@@ -1,0 +1,80 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1690,6 +1690,56 @@ void GS::vertexKick(bool drawing)
+             gsHistCount(chave.str());
+             gsHistFlushIfDue();
+         }
++        // Debug aid: PS2X_GS_SEQ=periodo:janela imprime, a cada `periodo` primitivas, as `janela` seguintes em sequencia
++        // comprimida (mesmo estado = uma linha com a contagem). Mostra a ordem de desenho sem o custo do histograma.
++        {
++            static const uint32_t seqPeriodo = []
++            {
++                const char *env = std::getenv("PS2X_GS_SEQ");
++                return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 0)) : 0u;
++            }();
++            static const uint32_t seqJanela = []
++            {
++                const char *env = std::getenv("PS2X_GS_SEQ");
++                const char *sep = env ? std::strchr(env, ':') : nullptr;
++                return sep ? static_cast<uint32_t>(std::strtoul(sep + 1, nullptr, 0)) : 0u;
++            }();
++            if (seqPeriodo != 0u)
++            {
++                static uint32_t seqConta = 0u, seqRepete = 0u;
++                static uint64_t seqChave = 0u, seqAlpha = 0u, seqTexa = 0u;
++                static GSVertex seqV0{}, seqV1{};
++                static uint32_t seqR = 0u;
++                const uint32_t pos = seqConta++ % seqPeriodo;
++                if (pos < seqJanela)
++                {
++                    const GSContext &c = activeContext();
++                    const uint64_t chave = static_cast<uint64_t>(m_prim.type) | (static_cast<uint64_t>(m_prim.tme) << 4) | (static_cast<uint64_t>(m_prim.abe) << 5) |
++                                           (static_cast<uint64_t>(m_prim.fst) << 6) | (static_cast<uint64_t>(c.frame.fbp) << 8) |
++                                           (static_cast<uint64_t>(c.tex0.tbp0) << 20) | (static_cast<uint64_t>(c.tex0.psm) << 36) |
++                                           (static_cast<uint64_t>(c.frame.fbmsk >> 24) << 44);
++                    if (pos == 0u || chave != seqChave || c.alpha != seqAlpha)
++                    {
++                        if (seqRepete != 0u)
++                            std::fprintf(stderr, "[gs:seq] %6u prim=%u tme=%u abe=%u fst=%u fbp=%u msk=%02x tbp=%u tpsm=0x%x alpha=0x%llx texa=0x%llx rgba=%u,%u,%u,%u v0=(%.1f,%.1f uv=%u,%u st=%.3f,%.3f) v1=(%.1f,%.1f uv=%u,%u)%c",
++                                         seqRepete, static_cast<unsigned>(seqChave & 0xFu), static_cast<unsigned>((seqChave >> 4) & 1u), static_cast<unsigned>((seqChave >> 5) & 1u), static_cast<unsigned>((seqChave >> 6) & 1u),
++                                         static_cast<unsigned>((seqChave >> 8) & 0xFFFu), static_cast<unsigned>(seqChave >> 44), static_cast<unsigned>((seqChave >> 20) & 0xFFFFu), static_cast<unsigned>((seqChave >> 36) & 0xFFu),
++                                         static_cast<unsigned long long>(seqAlpha), static_cast<unsigned long long>(seqTexa), seqV0.r, seqV0.g, seqV0.b, seqV0.a,
++                                         seqV0.x, seqV0.y, static_cast<unsigned>(seqV0.u), static_cast<unsigned>(seqV0.v), seqV0.s, seqV0.t, seqV1.x, seqV1.y, static_cast<unsigned>(seqV1.u), static_cast<unsigned>(seqV1.v), 10);
++                        if (pos == 0u)
++                            std::fprintf(stderr, "[gs:seq] ---- janela%c", 10);
++                        seqRepete = 0u;
++                        seqChave = chave;
++                        seqAlpha = c.alpha;
++                        seqTexa = (static_cast<uint64_t>(m_texa.ta0) << 0) | (static_cast<uint64_t>(m_texa.aem) << 8) | (static_cast<uint64_t>(m_texa.ta1) << 16);
++                        seqV0 = m_vtxQueue[0];
++                        seqV1 = m_vtxQueue[needed > 1 ? 1 : 0];
++                    }
++                    ++seqRepete;
++                }
++                (void)seqR;
++            }
++        }
+         // Debug aid: PS2X_GS_SAMPLE=N imprime 1 de cada N primitivas (destino, estado e vertices).
+         static const uint32_t sampleEvery = []
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -14,6 +14,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/gs/ps2_gs_psmt4.h"
++#include "runtime/gs/ps2_gs_psmt8.h"
+ #include "runtime/ee_scheduler.h"
+ #include "ThreadNaming.h"
+ #include "Kernel/Stubs/Audio.h"
+@@ -95,6 +96,8 @@ static void ps2xMaybeDumpVram(uint64_t tick, const uint8_t *vram)
+             {
+                 if (tipo == 32u)
+                     out.write(reinterpret_cast<const char *>(vram + (GSPSMCT32::addrPSMCT32(bloco, largura, x, y) & mask & ~3u)), 4);
++                else if (tipo == 8u)
++                    out.write(reinterpret_cast<const char *>(vram + (GSPSMT8::addrPSMT8(bloco, largura, x, y) & mask)), 1);
+                 else
+                 {
+                     const uint32_t nibble = GSPSMT4::addrPSMT4(bloco, largura, x, y);

@@ -1,0 +1,45 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -2297,6 +2297,41 @@ namespace ps2_stubs
+                 !playback.streamEnded &&
+                 !playback.decoderFailed)
+             {
++                // Sem quadros: como o sceMpegGetPicture real, pede dados ao callback sceMpegCbNodata (tipo 1) do jogo,
++                // que entrega o proximo bloco com sceMpegAddBs. Depois tenta de novo; retorno 0 = fim do fluxo.
++                const auto registrados = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
++                if (registrados != g_mpeg_stub_state.callbacksByMpeg.end())
++                {
++                    for (const MpegRegisteredCallback &callback : registrados->second)
++                    {
++                        if (callback.stream || callback.type != 1u || callback.func == 0u)
++                        {
++                            continue;
++                        }
++                        GuestInvocation invocation{};
++                        invocation.kind = GuestInvocationKind::HleCall;
++                        invocation.context = *ctx;
++                        invocation.context.pc = callback.func;
++                        SET_GPR_U32(&invocation.context, 4, mpegAddr);
++                        SET_GPR_U32(&invocation.context, 5, 0u);
++                        SET_GPR_U32(&invocation.context, 6, callback.data);
++                        SET_GPR_U32(&invocation.context, 29, 0u);
++                        SET_GPR_U32(&invocation.context, 31, 0u);
++                        invocation.onComplete = [rdram, runtime, mpegAddr](const R5900Context &callee, R5900Context &parent)
++                        {
++                            if (getRegU32(&callee, 2) == 0u)
++                            {
++                                std::lock_guard<std::mutex> endLock(g_mpeg_stub_mutex);
++                                MpegPlaybackState &ended = getPlaybackState(mpegAddr);
++                                ended.streamEnded = true;
++                                flushDecoderIfEnded(ended);
++                            }
++                            sceMpegGetPicture(rdram, &parent, runtime);
++                        };
++                        lock.unlock();
++                        runtime->eeScheduler().invokeCurrent(std::move(invocation));
++                    }
++                }
+                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
+                 {
+                     PS2_IF_AGRESSIVE_LOGS({

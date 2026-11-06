@@ -1,0 +1,303 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 6bdd9e5..b5e3f72 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -9,6 +9,7 @@
+ #include <atomic>
+ #include <algorithm>
+ #include <bitset>
++#include <chrono>
+ #include <cstdlib>
+ #include <thread>
+ #if defined(__x86_64__) || defined(_M_X64)
+@@ -469,6 +470,35 @@ namespace
+         std::this_thread::yield();
+ #endif
+     }
++
++    // Debug aid: PS2X_GS_FILA_STAT=1 imprime a cada ~5 s o que a thread que publica gastou esperando o anel.
++    const bool g_filaStatLigado = std::getenv("PS2X_GS_FILA_STAT") != nullptr;
++    struct EstatisticaFila
++    {
++        uint64_t publicacoes = 0u, avisos = 0u, esperasCheio = 0u, drenagens = 0u, drenagensComEspera = 0u;
++        std::chrono::steady_clock::duration tempoAviso{}, tempoCheio{}, tempoDrenagem{};
++        std::chrono::steady_clock::time_point inicio = std::chrono::steady_clock::now();
++    };
++    EstatisticaFila g_estatisticaFila;
++
++    long long msDe(std::chrono::steady_clock::duration d)
++    {
++        return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
++    }
++
++    void talvezImprimirFila()
++    {
++        EstatisticaFila &e = g_estatisticaFila;
++        const auto agora = std::chrono::steady_clock::now();
++        if (agora - e.inicio < std::chrono::seconds(5))
++            return;
++        std::fprintf(stderr, "[gs-fila] publicacoes=%llu avisos=%llu aviso_ms=%lld cheio=%llu cheio_ms=%lld drenagens=%llu com_espera=%llu drenagem_ms=%lld total_ms=%lld\n",
++                     static_cast<unsigned long long>(e.publicacoes), static_cast<unsigned long long>(e.avisos), msDe(e.tempoAviso),
++                     static_cast<unsigned long long>(e.esperasCheio), msDe(e.tempoCheio),
++                     static_cast<unsigned long long>(e.drenagens), static_cast<unsigned long long>(e.drenagensComEspera), msDe(e.tempoDrenagem),
++                     msDe(agora - e.inicio));
++        e = {};
++    }
+ }
+ 
+ enum class TipoComandoGs : uint8_t
+@@ -523,8 +553,17 @@ struct GSCpuBackend::Fila
+     ComandoGs &reservar()
+     {
+         const uint64_t h = cabeca.load(std::memory_order_relaxed);
+-        while (h - menorCauda() >= kTamanho)
+-            std::this_thread::yield();
++        if (h - menorCauda() >= kTamanho)
++        {
++            const auto t0 = g_filaStatLigado ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++            while (h - menorCauda() >= kTamanho)
++                std::this_thread::yield();
++            if (g_filaStatLigado)
++            {
++                ++g_estatisticaFila.esperasCheio;
++                g_estatisticaFila.tempoCheio += std::chrono::steady_clock::now() - t0;
++            }
++        }
+         return anel[h & (kTamanho - 1u)];
+     }
+ 
+@@ -533,7 +572,20 @@ struct GSCpuBackend::Fila
+         const uint64_t h = cabeca.load(std::memory_order_relaxed) + 1u;
+         cabeca.store(h, std::memory_order_seq_cst);
+         if (dormindo.load(std::memory_order_seq_cst) != 0)
++        {
++            const auto t0 = g_filaStatLigado ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+             cabeca.notify_all();
++            if (g_filaStatLigado)
++            {
++                ++g_estatisticaFila.avisos;
++                g_estatisticaFila.tempoAviso += std::chrono::steady_clock::now() - t0;
++            }
++        }
++        if (g_filaStatLigado)
++        {
++            ++g_estatisticaFila.publicacoes;
++            talvezImprimirFila();
++        }
+     }
+ };
+ 
+@@ -580,8 +632,19 @@ void GSCpuBackend::drenarFila() const
+     if (!m_fila || t_faixa >= 0)
+         return;
+     const uint64_t h = m_fila->cabeca.load(std::memory_order_relaxed);
++    const bool espera = m_fila->menorCauda() < h;
++    const auto t0 = g_filaStatLigado && espera ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     while (m_fila->menorCauda() < h)
+         std::this_thread::yield();
++    if (g_filaStatLigado)
++    {
++        ++g_estatisticaFila.drenagens;
++        if (espera)
++        {
++            ++g_estatisticaFila.drenagensComEspera;
++            g_estatisticaFila.tempoDrenagem += std::chrono::steady_clock::now() - t0;
++        }
++    }
+ }
+ 
+ void GSCpuBackend::executarBarreira(ComandoGs &comando)
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index de627e9..c72407b 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -8,6 +8,52 @@
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++namespace
++{
++    // Debug aid: PS2X_EE_STAT=1 imprime a cada ~5 s quantas trocas por excecao (EeDispatcherTransfer) houve, por origem, e o tempo do throw ao catch.
++    const bool g_eeStatLigado = std::getenv("PS2X_EE_STAT") != nullptr;
++    struct EstatisticaTroca
++    {
++        uint64_t porOrigem[8]{};
++        uint64_t total = 0u;
++        std::chrono::steady_clock::duration tempo{};
++        std::chrono::steady_clock::time_point lancamento{};
++        std::chrono::steady_clock::time_point inicio = std::chrono::steady_clock::now();
++    };
++    EstatisticaTroca g_troca;
++
++    inline void marcaTroca(int origem)
++    {
++        if (!g_eeStatLigado)
++            return;
++        ++g_troca.porOrigem[origem & 7];
++        ++g_troca.total;
++        g_troca.lancamento = std::chrono::steady_clock::now();
++    }
++
++    inline void chegouTroca()
++    {
++        if (!g_eeStatLigado || g_troca.lancamento == std::chrono::steady_clock::time_point{})
++            return;
++        const auto agora = std::chrono::steady_clock::now();
++        g_troca.tempo += agora - g_troca.lancamento;
++        g_troca.lancamento = {};
++        if (agora - g_troca.inicio > std::chrono::seconds(5))
++        {
++            const EstatisticaTroca &e = g_troca;
++            std::fprintf(stderr, "[ee-troca] total=%llu fim_thread=%llu pedido=%llu invoca=%llu invoca_lista=%llu bloqueio=%llu ms=%lld total_ms=%lld%c",
++                         (unsigned long long)e.total, (unsigned long long)e.porOrigem[0], (unsigned long long)e.porOrigem[1],
++                         (unsigned long long)e.porOrigem[2], (unsigned long long)e.porOrigem[3], (unsigned long long)e.porOrigem[4],
++                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(e.tempo).count(),
++                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(agora - e.inicio).count(), 10);
++            g_troca = {};
++        }
++    }
++}
+ 
+ uint32_t ps2xCop0CountNow();
+ 
+@@ -210,6 +256,7 @@ void EeScheduler::run()
+             }
+             catch (const EeDispatcherTransfer &)
+             {
++                chegouTroca();
+             }
+             if (m_currentThreadId == 0)
+             {
+@@ -244,6 +291,7 @@ void EeScheduler::run()
+                     }
+                     catch (const EeDispatcherTransfer &)
+                     {
++                        chegouTroca();
+                     }
+                 }
+                 continue;
+@@ -305,6 +353,7 @@ void EeScheduler::run()
+         }
+         catch (const EeDispatcherTransfer &)
+         {
++            chegouTroca();
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+@@ -529,6 +578,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+         m_runtime.guestFree(ownedStack);
+     }
+     publishSnapshot();
++    marcaTroca(0);
+     throw EeDispatcherTransfer{};
+ }
+ 
+@@ -818,6 +868,7 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
+     m_rescheduleRequested = false;
+     m_timeSliceExpired = false;
+     publishSnapshot();
++    marcaTroca(1);
+     throw EeDispatcherTransfer{};
+ }
+ 
+@@ -1121,6 +1172,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     invocation.sequence = ++m_invocationSequence;
+     owner->invocations.push_back(std::move(invocation));
+     publishSnapshot();
++    marcaTroca(2);
+     throw EeDispatcherTransfer{};
+ }
+ 
+@@ -1140,6 +1192,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+         owner->invocations.push_back(std::move(*it));
+     }
+     publishSnapshot();
++    marcaTroca(3);
+     throw EeDispatcherTransfer{};
+ }
+ 
+@@ -1691,6 +1744,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
+     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
+     m_currentThreadId = 0;
+     publishSnapshot();
++    marcaTroca(4);
+     throw EeDispatcherTransfer{};
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/thirdage_perfil.cpp b/ps2xRuntime/src/lib/thirdage_perfil.cpp
+index 1995d0c..5366705 100644
+--- a/ps2xRuntime/src/lib/thirdage_perfil.cpp
++++ b/ps2xRuntime/src/lib/thirdage_perfil.cpp
+@@ -36,6 +36,8 @@ void ps2xIniciarPerfil()
+         uint64_t total = 0u;
+         std::map<std::string, uint64_t> foraDoExe;
+         std::map<DWORD, uint64_t> porThreadFora;
++        std::map<uint64_t, uint64_t> chamadorDaDll;
++        std::map<uint64_t, uint64_t> chamador2;
+         for (;;)
+         {
+             HANDLE lista = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+@@ -53,7 +55,7 @@ void ps2xIniciarPerfil()
+                     if (SuspendThread(t) != static_cast<DWORD>(-1))
+                     {
+                         CONTEXT c{};
+-                        c.ContextFlags = CONTEXT_CONTROL;
++                        c.ContextFlags = CONTEXT_FULL;
+                         if (GetThreadContext(t, &c))
+                         {
+                             if (c.Rip >= base && c.Rip < fim)
+@@ -71,6 +73,39 @@ void ps2xIniciarPerfil()
+                                     GetModuleBaseNameA(GetCurrentProcess(), m, nome, sizeof(nome));
+                                 ++foraDoExe[nome];
+                                 ++porThreadFora[te.th32ThreadID];
++                                // Sobe a pilha (unwind do x64) ate o primeiro quadro dentro do .exe: mostra quem chamou a DLL.
++                                CONTEXT u = c;
++                                int quadrosNoExe = 0;
++                                for (int quadro = 0; quadro < 64; ++quadro)
++                                {
++                                    DWORD64 imagem = 0;
++                                    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(u.Rip, &imagem, nullptr);
++                                    if (!fn)
++                                    {
++                                        // Funcao folha: o endereco de retorno esta no topo da pilha.
++                                        u.Rip = *reinterpret_cast<DWORD64 *>(u.Rsp);
++                                        u.Rsp += 8;
++                                    }
++                                    else
++                                    {
++                                        PVOID dados = nullptr;
++                                        DWORD64 quadroBase = 0;
++                                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imagem, u.Rip, fn, &u, &dados, &quadroBase, nullptr);
++                                    }
++                                    if (u.Rip == 0)
++                                        break;
++                                    if (u.Rip >= base && u.Rip < fim)
++                                    {
++                                        // 1o quadro no .exe em chamadorDaDll; os 2 seguintes em chamador2 (chave: thread, nivel, RVA).
++                                        const uint64_t rva = (u.Rip - base) & ~15ull;
++                                        if (quadrosNoExe == 0)
++                                            ++chamadorDaDll[(static_cast<uint64_t>(te.th32ThreadID) << 40u) | rva];
++                                        else
++                                            ++chamador2[(static_cast<uint64_t>(te.th32ThreadID) << 40u) | (static_cast<uint64_t>(quadrosNoExe) << 36u) | rva];
++                                        if (++quadrosNoExe >= 3)
++                                            break;
++                                    }
++                                }
+                             }
+                         }
+                         ResumeThread(t);
+@@ -95,6 +130,10 @@ void ps2xIniciarPerfil()
+                         std::fprintf(f, "thread_fora %lu %llu%c", static_cast<unsigned long>(p.first), static_cast<unsigned long long>(p.second), 10);
+                     for (const auto &p : contagem)
+                         std::fprintf(f, "%llx %llu\n", static_cast<unsigned long long>(p.first), static_cast<unsigned long long>(p.second));
++                    for (const auto &p : chamadorDaDll)
++                        std::fprintf(f, "chamador %llx %llu\n", static_cast<unsigned long long>(p.first), static_cast<unsigned long long>(p.second));
++                    for (const auto &p : chamador2)
++                        std::fprintf(f, "chamador2 %llx %llu\n", static_cast<unsigned long long>(p.first), static_cast<unsigned long long>(p.second));
+                     std::fclose(f);
+                 }
+             }

@@ -152,6 +152,32 @@ def main():
     body = novo
     print(f"entry_ cortados: {cortados}; entry_ duplicados de funcao removidos: {removidos}")
     body.sort(key=lambda r: (int(r[1], 16), r[0]))
+
+    # O Ghidra as vezes abre um entry_ no delay slot, e o entry_ anterior termina no branch sem executa-lo.
+    # O scheduler retoma lacos pelo entry_ (ex.: entry_001c99a8 perdia o `addiu $a0,1` e girava para sempre):
+    # junta os dois registros para o delay slot voltar ao corpo.
+    def tem_delay_slot(ins):
+        op, rs, rt, fn = ins >> 26, (ins >> 21) & 31, (ins >> 16) & 31, ins & 63
+        if op == 0:
+            return fn in (8, 9)
+        if op == 1:
+            return rt in (0, 1, 2, 3, 16, 17, 18, 19)
+        if op in (16, 17, 18):
+            return rs == 8
+        return op in (2, 3, 4, 5, 6, 7, 20, 21, 22, 23)
+
+    novo, juntados = [], 0
+    for r in body:
+        if novo and novo[-1][0].startswith("entry_") and r[0].startswith("entry_"):
+            s0, e0 = int(novo[-1][1], 16), int(novo[-1][2], 16)
+            if e0 == int(r[1], 16) and tem_delay_slot(w(e0 - 4)):
+                e1 = int(r[2], 16)
+                novo[-1] = [novo[-1][0], novo[-1][1], f"0x{e1:08X}", str(e1 - s0)]
+                juntados += 1
+                continue
+        novo.append(r)
+    body = novo
+    print(f"entry_ juntados para manter o delay slot: {juntados}")
     with open(out, "w", newline="") as f:
         wr = csv.writer(f, lineterminator="\n")
         if header:

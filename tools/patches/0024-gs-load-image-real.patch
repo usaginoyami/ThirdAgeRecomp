@@ -1,0 +1,55 @@
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -13,6 +13,7 @@
+ #include <vector>
+ 
+ void ps2xAplicarThirdAgePad2(PS2Runtime &runtime); // thirdage_pad2.cpp
++void ps2xAplicarThirdAgeGs(PS2Runtime &runtime);   // thirdage_gs.cpp
+ 
+ namespace
+ {
+@@ -130,6 +131,7 @@ namespace ps2_game_overrides
+         if (equalsIgnoreCaseAscii(basenameFromPath(elfPath), "SLUS_210.27"))
+         {
+             ps2xAplicarThirdAgePad2(runtime);
++            ps2xAplicarThirdAgeGs(runtime);
+         }
+ 
+         std::vector<Descriptor> descriptors;
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -387,6 +387,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+     src/lib/thirdage_pad2.cpp
++    src/lib/thirdage_gs.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -778,6 +778,21 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+         recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
+ 
+         bool pre = ((tagLo >> 46) & 1) != 0;
++        // Debug aid: PS2X_GS_LINHAS=N despeja os N primeiros pacotes GIF cuja tag pede linhas (LINE/LINESTRIP).
++        {
++            static const char *linhasEnv = std::getenv("PS2X_GS_LINHAS");
++            static uint32_t linhasRestam = linhasEnv ? static_cast<uint32_t>(std::strtoul(linhasEnv, nullptr, 0)) : 0u;
++            const uint32_t primTag = static_cast<uint32_t>((tagLo >> 47) & 7u);
++            if (linhasRestam != 0u && pre && (primTag == 1u || primTag == 2u))
++            {
++                --linhasRestam;
++                std::fprintf(stderr, "[gs:linha] tam=%u pos=%u tag=%016llx %016llx nloop=%u flg=%u nreg=%u prim=0x%llx%c", sizeBytes, offset - 16u,
++                             static_cast<unsigned long long>(tagHi), static_cast<unsigned long long>(tagLo), nloop, static_cast<unsigned>(flg), nreg,
++                             static_cast<unsigned long long>((tagLo >> 47) & 0x7FFu), 10);
++                for (uint32_t q = (offset >= 48u ? offset - 48u : 0u), n = 0u; q + 16u <= sizeBytes && n < 28u; q += 16u, ++n)
++                    std::fprintf(stderr, "[gs:linha]   +%04x %016llx %016llx%c", q, static_cast<unsigned long long>(loadLE64(data + q + 8)), static_cast<unsigned long long>(loadLE64(data + q)), 10);
++            }
++        }
+         if (pre)
+         {
+             writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);

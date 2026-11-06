@@ -1,0 +1,523 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -4,13 +4,17 @@
+ #include "runtime/gs/gs_texture_page_cache.h"
+ 
+ #include <array>
++#include <memory>
+ #include <mutex>
+ #include <vector>
+ 
++struct ComandoGs;
++
+ class GSCpuBackend final : public GSRasterBackend
+ {
+ public:
+     GSCpuBackend();
++    ~GSCpuBackend() override;
+ 
+     void Initialize(uint8_t *vram, uint32_t vramSize) override;
+     void Reset() override;
+@@ -34,6 +38,17 @@ public:
+     GSTransferSnapshot GetTransferSnapshot() const override;
+ 
+ private:
++    // Fila de comandos e threads de desenho (ver gs_cpu_backend.cpp). Sem fila, tudo roda na thread que chama.
++    struct Fila;
++    void iniciarFila();
++    void pararFila();
++    void executarLoop(int faixa);
++    void executarBarreira(ComandoGs &comando);
++    void drenarFila() const;
++    bool usaFila() const;
++    std::unique_ptr<Fila> m_fila;
++    bool m_permiteFila = true;
++
+     void ResetUnlocked();
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+@@ -72,7 +87,8 @@ private:
+     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
+     std::array<uint16_t, 512> m_clut{};
+     std::array<uint32_t, 2> m_clutCbp{};
+-    GSMem::TexturePageCache m_texturePageCache;
++    static constexpr int kMaxThreads = 16;
++    std::array<GSMem::TexturePageCache, kMaxThreads + 1> m_texturePageCaches{};
+ 
+     GSTransferCommand m_transfer{};
+     GSTransferSnapshot m_transferState{};
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -8,6 +8,12 @@
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <algorithm>
++#include <bitset>
++#include <cstdlib>
++#include <thread>
++#if defined(__x86_64__) || defined(_M_X64)
++#include <emmintrin.h>
++#endif
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
+@@ -442,6 +448,217 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // Cada thread de desenho so escreve as linhas da sua faixa (16 linhas). Toda primitiva passa por todas as threads, na mesma ordem,
++    // entao cada pixel continua vendo as primitivas na ordem original. Fora das threads (t_faixa < 0) tudo e desenhado.
++    thread_local int t_faixa = -1;
++    thread_local int t_totalFaixas = 1;
++    thread_local int t_cacheTextura = 0;
++
++    inline bool faixaDonaDaLinha(int y)
++    {
++        return t_totalFaixas <= 1 || ((y >> 4) % t_totalFaixas) == t_faixa;
++    }
++
++    inline void esperaCurta()
++    {
++#if defined(__x86_64__) || defined(_M_X64)
++        _mm_pause();
++#else
++        std::this_thread::yield();
++#endif
++    }
++}
++
++enum class TipoComandoGs : uint8_t
++{
++    Desenho,
++    Sincronia,
++    Clut,
++    IniciaTransferencia,
++    Imagem,
++    TexFlush,
++    EscreveVram,
++    Parar
++};
++
++struct ComandoGs
++{
++    TipoComandoGs tipo = TipoComandoGs::Sincronia;
++    GSPrimitiveBatch batch{};
++    GSTex0Reg tex0{};
++    GSTexClutReg texclut{};
++    GSTransferCommand transferencia{};
++    std::vector<uint8_t> dados;
++    uint32_t psm = 0u, base = 0u, bw = 0u, x = 0u, y = 0u, valor = 0u;
++};
++
++struct GSCpuBackend::Fila
++{
++    static constexpr uint64_t kTamanho = 1u << 14u;
++    std::vector<ComandoGs> anel = std::vector<ComandoGs>(kTamanho);
++    alignas(64) std::atomic<uint64_t> cabeca{0u};
++    alignas(64) std::atomic<int> dormindo{0};
++    alignas(64) std::atomic<int> chegaram{0};
++    alignas(64) std::atomic<uint64_t> barreiras{0u};
++    struct Cauda
++    {
++        alignas(64) std::atomic<uint64_t> valor{0u};
++    };
++    std::array<Cauda, GSCpuBackend::kMaxThreads> caudas{};
++    std::vector<std::thread> threads;
++    int total = 0;
++    // Paginas desenhadas desde a ultima sincronia (so a thread que publica usa).
++    std::bitset<512> paginasSujas;
++
++    uint64_t menorCauda() const
++    {
++        uint64_t menor = caudas[0].valor.load(std::memory_order_acquire);
++        for (int i = 1; i < total; ++i)
++            menor = std::min(menor, caudas[i].valor.load(std::memory_order_acquire));
++        return menor;
++    }
++
++    ComandoGs &reservar()
++    {
++        const uint64_t h = cabeca.load(std::memory_order_relaxed);
++        while (h - menorCauda() >= kTamanho)
++            std::this_thread::yield();
++        return anel[h & (kTamanho - 1u)];
++    }
++
++    void publicar()
++    {
++        const uint64_t h = cabeca.load(std::memory_order_relaxed) + 1u;
++        cabeca.store(h, std::memory_order_seq_cst);
++        if (dormindo.load(std::memory_order_seq_cst) != 0)
++            cabeca.notify_all();
++    }
++};
++
++GSCpuBackend::~GSCpuBackend()
++{
++    pararFila();
++}
++
++bool GSCpuBackend::usaFila() const
++{
++    return m_fila && t_faixa < 0;
++}
++
++void GSCpuBackend::iniciarFila()
++{
++    if (m_fila || !m_permiteFila)
++        return;
++    int total = static_cast<int>(std::thread::hardware_concurrency());
++    total = std::clamp(total - 2, 0, 8);
++    if (const char *env = std::getenv("PS2X_GS_THREADS"))
++        total = std::clamp(std::atoi(env), 0, kMaxThreads);
++    if (total <= 0)
++        return;
++    m_fila = std::make_unique<Fila>();
++    m_fila->total = total;
++    for (int i = 0; i < total; ++i)
++        m_fila->threads.emplace_back([this, i] { executarLoop(i); });
++    std::fprintf(stderr, "[gs] %d threads de desenho%c", total, 10);
++}
++
++void GSCpuBackend::pararFila()
++{
++    if (!m_fila)
++        return;
++    m_fila->reservar().tipo = TipoComandoGs::Parar;
++    m_fila->publicar();
++    for (std::thread &t : m_fila->threads)
++        t.join();
++    m_fila.reset();
++}
++
++void GSCpuBackend::drenarFila() const
++{
++    if (!m_fila || t_faixa >= 0)
++        return;
++    const uint64_t h = m_fila->cabeca.load(std::memory_order_relaxed);
++    while (m_fila->menorCauda() < h)
++        std::this_thread::yield();
++}
++
++void GSCpuBackend::executarBarreira(ComandoGs &comando)
++{
++    switch (comando.tipo)
++    {
++    case TipoComandoGs::Clut:
++        LoadClut(comando.tex0, comando.texclut);
++        break;
++    case TipoComandoGs::IniciaTransferencia:
++        BeginTransfer(comando.transferencia);
++        break;
++    case TipoComandoGs::Imagem:
++        UploadImage(comando.dados.data(), static_cast<uint32_t>(comando.dados.size()));
++        break;
++    case TipoComandoGs::TexFlush:
++        TextureFlush();
++        break;
++    case TipoComandoGs::EscreveVram:
++        WriteVram(comando.psm, comando.base, comando.bw, comando.x, comando.y, comando.valor);
++        break;
++    default:
++        break;
++    }
++}
++
++void GSCpuBackend::executarLoop(int faixa)
++{
++    t_faixa = faixa;
++    t_totalFaixas = m_fila->total;
++    t_cacheTextura = faixa + 1;
++    Fila &fila = *m_fila;
++    uint64_t proximo = 0u;
++    for (;;)
++    {
++        uint64_t h = fila.cabeca.load(std::memory_order_acquire);
++        for (int giros = 0; h == proximo && giros < 4000; ++giros)
++        {
++            esperaCurta();
++            h = fila.cabeca.load(std::memory_order_acquire);
++        }
++        if (h == proximo)
++        {
++            fila.dormindo.fetch_add(1, std::memory_order_seq_cst);
++            fila.cabeca.wait(proximo, std::memory_order_seq_cst);
++            fila.dormindo.fetch_sub(1, std::memory_order_seq_cst);
++            continue;
++        }
++        ComandoGs &comando = fila.anel[proximo & (Fila::kTamanho - 1u)];
++        if (comando.tipo == TipoComandoGs::Parar)
++            return;
++        if (comando.tipo == TipoComandoGs::Desenho)
++        {
++            if (m_vram)
++                DrawPrimitive(comando.batch);
++        }
++        else
++        {
++            // Barreira: todas as threads terminaram o que veio antes; a ultima a chegar executa e libera as demais.
++            const uint64_t numero = fila.barreiras.load(std::memory_order_acquire);
++            if (fila.chegaram.fetch_add(1, std::memory_order_acq_rel) + 1 == fila.total)
++            {
++                executarBarreira(comando);
++                fila.chegaram.store(0, std::memory_order_release);
++                fila.barreiras.store(numero + 1u, std::memory_order_release);
++            }
++            else
++            {
++                while (fila.barreiras.load(std::memory_order_acquire) == numero)
++                    esperaCurta();
++            }
++        }
++        ++proximo;
++        fila.caudas[faixa].valor.store(proximo, std::memory_order_release);
++    }
++}
++
+ GSCpuBackend::GSCpuBackend()
+ {
+     using namespace GSMem;
+@@ -518,14 +735,18 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+     if (vram && vramSize < GSMem::MEMORY_SIZE)
+         throw std::invalid_argument("GS CPU backend requires at least 4 MiB of VRAM");
+ 
++    drenarFila();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     m_vram = vram;
+     m_vramSize = vramSize;
+     ResetUnlocked();
++    if (vram)
++        iniciarFila();
+ }
+ 
+ void GSCpuBackend::Reset()
+ {
++    drenarFila();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     ResetUnlocked();
+ }
+@@ -534,7 +755,8 @@ void GSCpuBackend::ResetUnlocked()
+ {
+     m_clut.fill(0u);
+     m_clutCbp.fill(0u);
+-    m_texturePageCache.Invalidate();
++    for (GSMem::TexturePageCache &cache : m_texturePageCaches)
++        cache.Invalidate();
+     m_transfer = {};
+     m_transfer.direction = 3u;
+     m_transferState = {};
+@@ -545,6 +767,41 @@ void GSCpuBackend::ResetUnlocked()
+ 
+ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+ {
++    if (usaFila())
++    {
++        if (batch.vertexCount == 0u)
++            return;
++        Fila &fila = *m_fila;
++        const GSContext &ctx = batch.state.context;
++        // Textura lendo uma area ja desenhada e ainda na fila: espera as threads, senao cada faixa veria um estado diferente.
++        if (batch.state.prim.tme)
++        {
++            const uint32_t pagina = ctx.tex0.tbp0 >> 5u;
++            const uint32_t linhas = (static_cast<uint32_t>(batch.state.textureHeight) >> 5u) + 1u;
++            const uint32_t paginas = std::max<uint32_t>(ctx.tex0.tbw, 1u) * linhas;
++            bool suja = false;
++            for (uint32_t i = 0u; i < paginas && !suja; ++i)
++                suja = fila.paginasSujas[(pagina + i) & 511u];
++            if (suja)
++            {
++                fila.reservar().tipo = TipoComandoGs::Sincronia;
++                fila.publicar();
++                fila.paginasSujas.reset();
++            }
++        }
++        const uint32_t linhasFb = (static_cast<uint32_t>(std::max<int>(ctx.scissor.y1, 0)) >> 5u) + 1u;
++        const uint32_t paginasFb = std::max<uint32_t>(ctx.frame.fbw, 1u) * linhasFb;
++        for (uint32_t i = 0u; i < paginasFb; ++i)
++        {
++            fila.paginasSujas.set((ctx.frame.fbp + i) & 511u);
++            fila.paginasSujas.set((ctx.zbuf.zbp + i) & 511u);
++        }
++        ComandoGs &comando = fila.reservar();
++        comando.tipo = TipoComandoGs::Desenho;
++        comando.batch = batch;
++        fila.publicar();
++        return;
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
+@@ -553,6 +810,16 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+ 
+ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
++    if (usaFila())
++    {
++        ComandoGs &comando = m_fila->reservar();
++        comando.tipo = TipoComandoGs::Clut;
++        comando.tex0 = tex0;
++        comando.texclut = texclut;
++        m_fila->publicar();
++        m_fila->paginasSujas.reset();
++        return;
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
+         return;
+@@ -643,17 +910,28 @@ void GSCpuBackend::Flush()
+ 
+ void GSCpuBackend::TextureFlush()
+ {
++    if (usaFila())
++    {
++        m_fila->reservar().tipo = TipoComandoGs::TexFlush;
++        m_fila->publicar();
++        m_fila->paginasSujas.reset();
++        return;
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    m_texturePageCache.Invalidate();
++    for (GSMem::TexturePageCache &cache : m_texturePageCaches)
++        cache.Invalidate();
+ }
+ 
+-void GSCpuBackend::Sync(GSSyncReason)
++void GSCpuBackend::Sync(GSSyncReason reason)
+ {
+-    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
++    // A apresentacao nao espera: as threads podem estar atras, mas segurar o EE aqui anularia o paralelismo.
++    if (reason != GSSyncReason::Presentation)
++        drenarFila();
+ }
+ 
+ uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
++    drenarFila();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     return ReadVramUnlocked(psm, base, bw, x, y);
+ }
+@@ -670,11 +948,25 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
+     if (!m_vram)
+         return 0u;
+ 
+-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
++    return GSMem::ReadTexture(m_texturePageCaches[t_cacheTextura], m_vram, psm, base, bw, x, y);
+ }
+ 
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
++    if (usaFila())
++    {
++        ComandoGs &comando = m_fila->reservar();
++        comando.tipo = TipoComandoGs::EscreveVram;
++        comando.psm = psm;
++        comando.base = base;
++        comando.bw = bw;
++        comando.x = x;
++        comando.y = y;
++        comando.valor = value;
++        m_fila->publicar();
++        m_fila->paginasSujas.reset();
++        return;
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     WriteVramUnlocked(psm, base, bw, x, y, value);
+ }
+@@ -688,6 +980,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+ 
+ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
++    drenarFila();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || m_vramSize == 0u)
+     {
+@@ -851,6 +1144,8 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+     const auto &ctx = state.context;
+     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
+         return;
++    if (!faixaDonaDaLinha(y))
++        return;
+ 
+     if (state.prim.fge)
+     {
+@@ -1236,6 +1531,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+ 
+         for (int y = drawY0; y <= drawY1; ++y)
+         {
++            if (!faixaDonaDaLinha(y))
++                continue;
+             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+             float texVf = v0f + (v1f - v0f) * ty;
+ 
+@@ -1313,6 +1610,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+ 
+     for (int y = minY; y <= maxY; ++y)
+     {
++        if (!faixaDonaDaLinha(y))
++            continue;
+         float py = static_cast<float>(y) + 0.5f;
+         for (int x = minX; x <= maxX; ++x)
+         {
+@@ -1462,6 +1761,15 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ 
+ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
++    if (usaFila())
++    {
++        ComandoGs &comando = m_fila->reservar();
++        comando.tipo = TipoComandoGs::IniciaTransferencia;
++        comando.transferencia = command;
++        m_fila->publicar();
++        m_fila->paginasSujas.reset();
++        return;
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     m_transfer = command;
+     m_transferState.x = command.trxpos.dsax;
+@@ -1479,6 +1787,17 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ 
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
++    if (usaFila())
++    {
++        if (!data || sizeBytes == 0u)
++            return;
++        ComandoGs &comando = m_fila->reservar();
++        comando.tipo = TipoComandoGs::Imagem;
++        comando.dados.assign(data, data + sizeBytes);
++        m_fila->publicar();
++        m_fila->paginasSujas.reset();
++        return;
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+@@ -1696,6 +2015,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+ 
+ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
++    drenarFila();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
+         return 0u;
+@@ -1708,6 +2028,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ 
+ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
++    drenarFila();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || context.frame.fbw == 0u)
+         return false;
+@@ -1853,6 +2174,7 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+         return {};
+ 
+     thread_local GSCpuBackend snapshotBackend;
++    snapshotBackend.m_permiteFila = false;
+     snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
+     return snapshotBackend.PresentFromLocalMemory(request);
+ }

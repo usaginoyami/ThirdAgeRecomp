@@ -1,0 +1,184 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 27904ab..1ad8412 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,4 +1,5 @@
+ #include <chrono>
++#include <x86intrin.h>
+ #include <cstdio>
+ #include <cstdlib>
+ #include "runtime/ps2_vu1.h"
+@@ -92,10 +93,21 @@ namespace
+         uint64_t ciclos = 0u;
+         uint64_t pares = 0u;
+         std::chrono::steady_clock::duration tempo{};
++        std::chrono::steady_clock::duration tempoGif{};
++        uint64_t envios = 0u;
++        uint64_t fase[8]{};
+         std::chrono::steady_clock::time_point inicio = std::chrono::steady_clock::now();
+     };
+     EstatisticaVu g_estatisticaVu[2];
+     const bool g_vuStatLigado = std::getenv("PS2X_VU_STAT") != nullptr;
++    // PS2X_VU_FASE=1 (com PS2X_VU_STAT) mede, com rdtsc, os ciclos de CPU por par em cada fase do laco de run. Custa ~15%.
++    const bool g_vuFaseLigado = g_vuStatLigado && std::getenv("PS2X_VU_FASE") != nullptr;
++
++    // Escrita imediata (padrao): VF/VI/ACC recebem na hora o valor que a fila gravaria quando a latencia acabasse.
++    // Toda leitura dessas registradoras ja para ate o "pronto em" (m_vfReady/m_viReady/m_accReady, que continuam iguais),
++    // entao nenhuma leitura com parada ve diferenca. Flags, Q, P e stores continuam com atraso (sao lidos sem parada).
++    // PS2X_VU_FILAS=1 volta ao modelo antigo, com as filas de escrita, para comparar.
++    const bool g_vuEscritaImediata = std::getenv("PS2X_VU_FILAS") == nullptr;
+ }
+ 
+ void VU1Interpreter::resetScheduler()
+@@ -996,10 +1008,17 @@ void VU1Interpreter::finishXgkick()
+ 
+     g_ps2xStats[4].fetch_add(1u, std::memory_order_relaxed);
+     g_ps2xStats[5].fetch_add(m_xgkick.totalBytes, std::memory_order_relaxed);
++    const auto inicioGif = g_vuStatLigado ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     if (m_activeMemory)
+         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+     else if (m_activeGs)
+         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
++    if (g_vuStatLigado)
++    {
++        EstatisticaVu &estat = g_estatisticaVu[m_unit == Unit::VU1 ? 1 : 0];
++        estat.tempoGif += std::chrono::steady_clock::now() - inicioGif;
++        ++estat.envios;
++    }
+     m_xgkick.active = false;
+ }
+ 
+@@ -1009,7 +1028,14 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+         return;
+ 
+     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
+-    m_xgkick = {};
++    // Sem m_xgkick = {}: zeraria os 64 KB do pacote a cada XGKICK; so os bytes ja copiados sao lidos.
++    m_xgkick.sourceAddress = 0u;
++    m_xgkick.totalBytes = 0u;
++    m_xgkick.copiedBytes = 0u;
++    m_xgkick.currentTagEnd = 0u;
++    m_xgkick.cycleCredit = 0u;
++    m_xgkick.issueCycle = 0u;
++    m_xgkick.currentTagEop = false;
+     m_xgkick.active = true;
+     m_xgkick.sourceAddress = sourceAddress;
+     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
+@@ -1749,6 +1775,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             break;
+ 
+         // Caminho comum: referencia direta ao cache, sem copiar a estrutura. A geracao e conferida abaixo, como em getDecodedInstructionPairForPc.
++        const bool medeFase = g_vuFaseLigado;
++        uint64_t marca = medeFase ? __rdtsc() : 0u;
++        uint64_t *const fases = g_estatisticaVu[m_unit == Unit::VU1 ? 1 : 0].fase;
++        const auto fecha = [&](int f)
++        {
++            if (medeFase)
++            {
++                const uint64_t agora = __rdtsc();
++                fases[f] += agora - marca;
++                marca = agora;
++            }
++        };
+         const uint32_t paresPc = m_state.pc;
+         const bool cacheDireto = (paresPc & 7u) == 0u && m_decodedCodeCacheValid && memory != nullptr &&
+                                  m_cachedVuCode == vuCode && m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
+@@ -1765,6 +1803,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             break;
+         }
+ 
++        fecha(0);
+         uint64_t readyCycle = calculatePairReadyCycle(decoded);
+         while (readyCycle > m_cycle)
+         {
+@@ -1779,6 +1818,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (m_cycle >= budgetEnd)
+             break;
+ 
++        fecha(1);
+         uint8_t writtenVi = 0u;
+         int32_t oldVi = 0;
+         for (uint32_t reg = 1; reg < 16u && (decoded.lowerUsage.viWrite & ~1u) != 0u; ++reg)
+@@ -1809,6 +1849,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (decoded.upperUsage.accWrite != 0u)
+             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
+ 
++        fecha(2);
+         if (decoded.iBit)
+         {
+             execUpper(decoded.upper);
+@@ -1841,8 +1882,35 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+         }
+ 
++        fecha(3);
+         m_viBranchBackupValid = false;
+ 
++        if (g_vuEscritaImediata)
++        {
++            // Mesmo valor final que a fila gravaria: o novo nas pistas enfileiradas, o antigo nas demais.
++            if (hasUpperWrite)
++            {
++                for (uint32_t component = 0; component < 4u; ++component)
++                    if ((upperWrite.lanes & laneForComponent(component)) == 0u)
++                        m_state.vf[upperWrite.reg][component] = oldUpperVf[component];
++            }
++            if (hasDistinctLowerWrite)
++            {
++                for (uint32_t component = 0; component < 4u; ++component)
++                    if ((lowerWrite.lanes & laneForComponent(component)) == 0u)
++                        m_state.vf[lowerWrite.reg][component] = oldLowerVf[component];
++            }
++            if (decoded.upperUsage.accWrite != 0u)
++            {
++                for (uint32_t component = 0; component < 4u; ++component)
++                    if ((decoded.upperUsage.accWrite & laneForComponent(component)) == 0u)
++                        m_state.acc[component] = oldAcc[component];
++            }
++            if (writtenVi != 0u)
++                m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
++        }
++        else
++        {
+         if (hasUpperWrite)
+         {
+             std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
+@@ -1881,6 +1949,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                     : decoded.lowerUsage.latency;
+             queueViWrite(writtenVi, newVi, latency);
+         }
++        }
+ 
+         markPairWrites(decoded);
+         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+@@ -1939,7 +2008,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+ 
+         ++paresExecutados;
++        fecha(4);
+         advanceOneCycle();
++        fecha(5);
+         if (programEnded)
+             break;
+     }
+@@ -1965,12 +2036,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         e.tempo += agora - instanteInicial;
+         if (agora - e.inicio > std::chrono::seconds(5))
+         {
+-            std::fprintf(stderr, "[vu-stat] unidade=%d chamadas=%llu ciclos=%llu pares=%llu dentro_ms=%lld total_ms=%lld\n",
++            if (e.pares != 0u && g_vuFaseLigado)
++                std::fprintf(stderr, "[vu-fase] unidade=%d ciclos_cpu_por_par busca=%.0f espera=%.0f preparo=%.0f exec=%.0f filas=%.0f avanco=%.0f%c",
++                             m_unit == Unit::VU1 ? 1 : 0,
++                             double(e.fase[0]) / e.pares, double(e.fase[1]) / e.pares, double(e.fase[2]) / e.pares,
++                             double(e.fase[3]) / e.pares, double(e.fase[4]) / e.pares, double(e.fase[5]) / e.pares, 10);
++            std::fprintf(stderr, "[vu-stat] unidade=%d chamadas=%llu ciclos=%llu pares=%llu dentro_ms=%lld gif_ms=%lld envios=%llu total_ms=%lld\n",
+                          m_unit == Unit::VU1 ? 1 : 0,
+                          static_cast<unsigned long long>(e.chamadas),
+                          static_cast<unsigned long long>(e.ciclos),
+                          static_cast<unsigned long long>(e.pares),
+                          static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(e.tempo).count()),
++                         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(e.tempoGif).count()),
++                         static_cast<unsigned long long>(e.envios),
+                          static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(agora - e.inicio).count()));
+             e = {};
+         }

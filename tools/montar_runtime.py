@@ -62,9 +62,56 @@ def gerar(tipo):
     run([exe, os.path.join("config", "thirdage.toml")], cwd=RAIZ)
 
 
+# O tradutor de VCLIP do PS2Recomp grava os bits de CLIP invertidos (-x antes de +x) e compara com w sem valor absoluto.
+# O VU real usa bit0=+x, bit1=-x, bit2=+y, bit3=-y, bit4=+z, bit5=-z. O jogo testa com a mascara 0x2f (ignora +z), entao
+# um z grande marcava o vertice como fora da tela (ADC=1) e nada era desenhado. O codigo gerado e corrigido aqui.
+VCLIP_ERRADO = (
+    b"__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); ",
+    b"uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | ((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | ((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); ",
+)
+VCLIP_CERTO = (
+    b"ft = _mm_andnot_ps(_mm_castsi128_ps(_mm_set1_epi32(0x80000000)), ft); __m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); ",
+    b"uint32_t flags = ((gt_mask & 0x1) << 0) | ((lt_mask & 0x1) << 1) | ((gt_mask & 0x2) << 1) | ((lt_mask & 0x2) << 2) | ((gt_mask & 0x4) << 2) | ((lt_mask & 0x4) << 3); ",
+)
+
+
+# vf0 e fixo em (0,0,0,1) no VU real. O jogo usa `vsub $vf0, a, b` so para atualizar as flags MAC e le com `cfc2 $vi17`, mas o
+# PS2Recomp grava o resultado em vf0 (estragando todo vmax/vmul seguinte) e nunca atualiza vu0_mac_flags. A flag so tem Z e S.
+VF0_ERRADO = b"ctx->vu0_vf[0] = PS2_VBLEND(ctx->vu0_vf[0], res, _mm_castsi128_ps(mask));"
+VF0_CERTO = (
+    b"static const uint8_t ps2xInv4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15}; "
+    b"const int ps2xDest = _mm_movemask_ps(_mm_castsi128_ps(mask)); "
+    b"const int ps2xS = _mm_movemask_ps(res) & ps2xDest; "
+    b"const int ps2xZ = _mm_movemask_ps(_mm_cmpeq_ps(res, _mm_setzero_ps())) & ps2xDest; "
+    b"ctx->vu0_mac_flags = static_cast<uint32_t>((ps2xInv4[ps2xS] << 4) | ps2xInv4[ps2xZ]);"
+)
+
+
+def corrigir_gerado():
+    """Devolve os nomes dos arquivos alterados; os demais mantem a data, para o build nao recompilar tudo."""
+    alterados = []
+    for a in os.listdir(GEN):
+        if not a.endswith(".cpp"):
+            continue
+        caminho = os.path.join(GEN, a)
+        with open(caminho, "rb") as f:
+            dados = f.read()
+        if VCLIP_ERRADO[1] not in dados and VF0_ERRADO not in dados:
+            continue
+        for errado, certo in zip(VCLIP_ERRADO, VCLIP_CERTO):
+            dados = dados.replace(errado, certo)
+        dados = dados.replace(VF0_ERRADO, VF0_CERTO)
+        with open(caminho, "wb") as f:
+            f.write(dados)
+        alterados.append(a)
+    print(f"VCLIP e vf0 corrigidos em {len(alterados)} arquivos gerados")
+    return alterados
+
+
 def montar():
     if not os.path.isdir(GEN) or not os.path.exists(os.path.join(GEN, "register_functions.cpp")):
         sys.exit("generated/ vazio: rode com --gerar (precisa de dados/SLUS_210.27)")
+    corrigir_gerado()
     if os.path.isdir(STAGE):
         shutil.rmtree(STAGE)
     shutil.copytree(SUB, STAGE, ignore=shutil.ignore_patterns(".git", "build*", "ps2xStudio", "android", "vita"))

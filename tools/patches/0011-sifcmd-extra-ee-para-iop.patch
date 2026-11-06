@@ -1,0 +1,34 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -976,15 +976,24 @@ namespace ps2_syscalls
+         uint32_t packetSize = getRegU32(ctx, 6);
+         uint32_t srcExtra = getRegU32(ctx, 7);
+
+-        uint32_t sp = getRegU32(ctx, 29);
+-        uint32_t destExtra = 0;
+-        uint32_t sizeExtra = 0;
+-        readStackU32(rdram, sp, 0x10, destExtra);
+-        readStackU32(rdram, sp, 0x14, sizeExtra);
++        // ABI do EE: o 5o e o 6o argumento vem em $t0/$t1, nao na pilha.
++        uint32_t destExtra = getRegU32(ctx, 8);
++        uint32_t sizeExtra = getRegU32(ctx, 9);
+
+         if (sizeExtra > 0 && srcExtra && destExtra)
+         {
+-            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
++            // O destino e memoria do IOP: e o bloco de comandos que o modulo le ao receber o pacote.
++            std::vector<uint8_t> payload(sizeExtra);
++            bool ok = runtime != nullptr;
++            for (uint32_t i = 0; i < sizeExtra && ok; ++i)
++            {
++                const uint8_t *src = getConstMemPtr(rdram, srcExtra + i);
++                ok = src != nullptr;
++                if (ok)
++                    payload[i] = *src;
++            }
++            if (!ok || !runtime->writeIopMemory(destExtra, payload.data(), payload.size()))
++                RUNTIME_LOG("[sceSifSendCmd] falha ao copiar extra src=0x" << std::hex << srcExtra << " dest=0x" << destExtra << " size=0x" << sizeExtra << std::dec << std::endl);
+         }
+
+         if (cid == 0x80000001u && packetSize >= 24u)
