@@ -1,0 +1,321 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 4a0b3ec..27904ab 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,3 +1,6 @@
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include "runtime/ps2_vu1.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -68,8 +71,36 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+     reset();
+ }
+ 
++namespace
++{
++    // Um bit por entrada valida de cada fila. O commit percorre so as entradas ocupadas, na mesma ordem de indice.
++    // Uma por unidade (so existem m_vu0 e m_vu1); fica aqui para nao mexer em ps2_vu1.h, incluido pelos 50 mil arquivos gerados.
++    struct MascarasPipeline
++    {
++        uint32_t flag = 0u;
++        uint32_t store = 0u;
++        uint32_t vf = 0u;
++        uint32_t vi = 0u;
++        uint32_t acc = 0u;
++    };
++    MascarasPipeline g_mascarasPipeline[2];
++
++    // Debug aid: PS2X_VU_STAT=1 imprime a cada ~5 s, por unidade: chamadas de run, ciclos, pares executados e tempo dentro de run.
++    struct EstatisticaVu
++    {
++        uint64_t chamadas = 0u;
++        uint64_t ciclos = 0u;
++        uint64_t pares = 0u;
++        std::chrono::steady_clock::duration tempo{};
++        std::chrono::steady_clock::time_point inicio = std::chrono::steady_clock::now();
++    };
++    EstatisticaVu g_estatisticaVu[2];
++    const bool g_vuStatLigado = std::getenv("PS2X_VU_STAT") != nullptr;
++}
++
+ void VU1Interpreter::resetScheduler()
+ {
++    g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0] = {};
+     m_flagPipeline = {};
+     m_fdiv = {};
+     m_efu = {};
+@@ -549,6 +580,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+ 
+     *entry = {};
+     entry->valid = true;
++    g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0].flag |= 1u << static_cast<uint32_t>(entry - m_flagPipeline.data());
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
+     entry->mac = mac;
+@@ -588,6 +620,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+         {
+             entry = {};
+             entry.valid = true;
++            g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0].flag |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+@@ -607,6 +640,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+         {
+             entry = {};
+             entry.valid = true;
++            g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0].flag |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
+             entry.clip = m_workingClip;
+@@ -631,6 +665,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+         {
+             entry = {};
+             entry.valid = true;
++            g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0].flag |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
+             entry.clip = m_workingClip;
+@@ -677,6 +712,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         if (!store.valid)
+         {
+             store.valid = true;
++            g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0].store |= 1u << static_cast<uint32_t>(&store - m_storePipeline.data());
+             store.readyCycle = m_cycle + 1u;
+             store.address = address;
+             store.laneMask = laneMask;
+@@ -696,8 +732,8 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+     {
+         if (!write.valid)
+         {
+-            write = {};
+             write.valid = true;
++            g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0].vf |= 1u << static_cast<uint32_t>(&write - m_vfWritePipeline.data());
+             write.readyCycle = m_cycle + latency;
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+@@ -722,8 +758,8 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+     {
+         if (!write.valid)
+         {
+-            write = {};
+             write.valid = true;
++            g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0].vi |= 1u << static_cast<uint32_t>(&write - m_viWritePipeline.data());
+             write.readyCycle = m_cycle + latency;
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+@@ -743,8 +779,8 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+     {
+         if (!write.valid)
+         {
+-            write = {};
+             write.valid = true;
++            g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0].acc |= 1u << static_cast<uint32_t>(&write - m_accWritePipeline.data());
+             write.readyCycle = m_cycle + latency;
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+@@ -762,9 +798,12 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
+-    for (FlagPipelineEntry &entry : m_flagPipeline)
++    MascarasPipeline &ativas = g_mascarasPipeline[m_unit == Unit::VU1 ? 1 : 0];
++    for (uint32_t bits = ativas.flag; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
++        const uint32_t indice = static_cast<uint32_t>(__builtin_ctz(bits));
++        FlagPipelineEntry &entry = m_flagPipeline[indice];
++        if (entry.readyCycle > m_cycle)
+             continue;
+ 
+         if (entry.writesMac)
+@@ -780,7 +819,8 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         if (entry.writesClip)
+             m_state.clip = entry.clip;
+-        entry = {};
++        entry.valid = false;
++        ativas.flag &= ~(1u << indice);
+     }
+ 
+     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+@@ -800,9 +840,11 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+     }
+ 
+-    for (PendingStore &store : m_storePipeline)
++    for (uint32_t bits = ativas.store; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!store.valid || store.readyCycle > m_cycle)
++        const uint32_t indice = static_cast<uint32_t>(__builtin_ctz(bits));
++        PendingStore &store = m_storePipeline[indice];
++        if (store.readyCycle > m_cycle)
+             continue;
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+@@ -815,12 +857,15 @@ void VU1Interpreter::commitReadyPipelines()
+             }
+             std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
+         }
+-        store = {};
++        store.valid = false;
++        ativas.store &= ~(1u << indice);
+     }
+ 
+-    for (PendingVfWrite &write : m_vfWritePipeline)
++    for (uint32_t bits = ativas.vf; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        const uint32_t indice = static_cast<uint32_t>(__builtin_ctz(bits));
++        PendingVfWrite &write = m_vfWritePipeline[indice];
++        if (write.readyCycle > m_cycle)
+             continue;
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+@@ -830,21 +875,27 @@ void VU1Interpreter::commitReadyPipelines()
+                 m_state.vf[write.reg][component] = write.value[component];
+             }
+         }
+-        write = {};
++        write.valid = false;
++        ativas.vf &= ~(1u << indice);
+     }
+ 
+-    for (PendingViWrite &write : m_viWritePipeline)
++    for (uint32_t bits = ativas.vi; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        const uint32_t indice = static_cast<uint32_t>(__builtin_ctz(bits));
++        PendingViWrite &write = m_viWritePipeline[indice];
++        if (write.readyCycle > m_cycle)
+             continue;
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+-        write = {};
++        write.valid = false;
++        ativas.vi &= ~(1u << indice);
+     }
+ 
+-    for (PendingAccWrite &write : m_accWritePipeline)
++    for (uint32_t bits = ativas.acc; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        const uint32_t indice = static_cast<uint32_t>(__builtin_ctz(bits));
++        PendingAccWrite &write = m_accWritePipeline[indice];
++        if (write.readyCycle > m_cycle)
+             continue;
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+@@ -854,7 +905,8 @@ void VU1Interpreter::commitReadyPipelines()
+                 m_state.acc[component] = write.value[component];
+             }
+         }
+-        write = {};
++        write.valid = false;
++        ativas.acc &= ~(1u << indice);
+     }
+ }
+ 
+@@ -875,10 +927,15 @@ void VU1Interpreter::progressXgkick()
+         }
+ 
+         const uint32_t qwordOffset = m_xgkick.copiedBytes;
+-        for (uint32_t i = 0; i < 16u; ++i)
++        const uint32_t origemQw = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
++        if (origemQw + 16u <= m_activeVuDataSize)
+         {
+-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
+-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
++            std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + origemQw, 16u);
++        }
++        else
++        {
++            for (uint32_t i = 0; i < 16u; ++i)
++                m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[(origemQw + i) % m_activeVuDataSize];
+         }
+         m_xgkick.copiedBytes += 16u;
+ 
+@@ -1016,13 +1073,29 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+     {
+         if (!usage)
+             continue;
+-        for (uint32_t index = 0; index < usage->vfReadCount; ++index)
++        // Na maioria dos pares nada esta pendente: o bit 63 de (ciclo - pronto) so liga se pronto > ciclo, sem desvio por componente.
++        // Entradas de vfRead nao usadas ficam {0, 0}: mascara zero, nao contam.
++        uint64_t pendente = 0u;
++        for (uint32_t index = 0; index < usage->vfRead.size(); ++index)
+         {
+             const VfAccess &access = usage->vfRead[index];
+-            for (uint32_t component = 0; component < 4u; ++component)
++            const std::array<uint64_t, 4> &prontos = m_vfReady[access.reg];
++            const uint64_t lanes = access.lanes;
++            pendente |= (m_cycle - prontos[0]) & (0u - ((lanes >> 3) & 1u));
++            pendente |= (m_cycle - prontos[1]) & (0u - ((lanes >> 2) & 1u));
++            pendente |= (m_cycle - prontos[2]) & (0u - ((lanes >> 1) & 1u));
++            pendente |= (m_cycle - prontos[3]) & (0u - (lanes & 1u));
++        }
++        if ((pendente >> 63) != 0u)
++        {
++            for (uint32_t index = 0; index < usage->vfReadCount; ++index)
+             {
+-                if ((access.lanes & laneForComponent(component)) != 0u)
+-                    ready = std::max(ready, m_vfReady[access.reg][component]);
++                const VfAccess &access = usage->vfRead[index];
++                for (uint32_t component = 0; component < 4u; ++component)
++                {
++                    if ((access.lanes & laneForComponent(component)) != 0u)
++                        ready = std::max(ready, m_vfReady[access.reg][component]);
++                }
+             }
+         }
+         if ((usage->viRead & ~1u) != 0u)
+@@ -1665,9 +1738,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
++    const uint64_t cicloInicial = m_cycle;
++    uint64_t paresExecutados = 0u;
++    const auto instanteInicial = g_vuStatLigado ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++    if (m_cycle < budgetEnd && !m_stopRequested)
++        commitReadyPipelines();
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+-        commitReadyPipelines();
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
+@@ -1861,6 +1938,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             m_pendingHaltT = tHalt;
+         }
+ 
++        ++paresExecutados;
+         advanceOneCycle();
+         if (programEnded)
+             break;
+@@ -1877,4 +1955,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     m_state.cycles = m_cycle;
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
++    if (g_vuStatLigado)
++    {
++        EstatisticaVu &e = g_estatisticaVu[m_unit == Unit::VU1 ? 1 : 0];
++        const auto agora = std::chrono::steady_clock::now();
++        ++e.chamadas;
++        e.ciclos += m_cycle - cicloInicial;
++        e.pares += paresExecutados;
++        e.tempo += agora - instanteInicial;
++        if (agora - e.inicio > std::chrono::seconds(5))
++        {
++            std::fprintf(stderr, "[vu-stat] unidade=%d chamadas=%llu ciclos=%llu pares=%llu dentro_ms=%lld total_ms=%lld\n",
++                         m_unit == Unit::VU1 ? 1 : 0,
++                         static_cast<unsigned long long>(e.chamadas),
++                         static_cast<unsigned long long>(e.ciclos),
++                         static_cast<unsigned long long>(e.pares),
++                         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(e.tempo).count()),
++                         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(agora - e.inicio).count()));
++            e = {};
++        }
++    }
+ }
