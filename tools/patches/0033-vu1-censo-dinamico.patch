@@ -1,0 +1,142 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 1ad8412..3a144c7 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -9,6 +9,9 @@
+ #include "ps2_vu1_detail.h"
+ 
+ #include <optional>
++#include <map>
++#include <unordered_map>
++#include <vector>
+ #include <algorithm>
+ #include <cfenv>
+ #include <cmath>
+@@ -108,6 +111,88 @@ namespace
+     // entao nenhuma leitura com parada ve diferenca. Flags, Q, P e stores continuam com atraso (sao lidos sem parada).
+     // PS2X_VU_FILAS=1 volta ao modelo antigo, com as filas de escrita, para comparar.
+     const bool g_vuEscritaImediata = std::getenv("PS2X_VU_FILAS") == nullptr;
++
++    // Debug aid: PS2X_VU1_CENSO=1 conta, por versao do codigo do VU1 (hash dos 16 KB), os pares executados, os pontos de
++    // entrada e os desvios tomados (origem -> destino, ja depois do delay slot). Regrava ps2x_vu1_censo.txt a cada ~20 s e
++    // salva cada versao em ps2x_vu1_codigo_<hash>.bin no diretorio atual (dados do jogo: nunca no repositorio).
++    const bool g_vu1CensoLigado = std::getenv("PS2X_VU1_CENSO") != nullptr;
++    struct VersaoCenso
++    {
++        std::vector<uint64_t> pares = std::vector<uint64_t>(2048u, 0u);
++        std::map<uint32_t, uint64_t> entradas;
++        std::map<uint64_t, uint64_t> arestas;
++        uint64_t total = 0u;
++        uint64_t chamadas = 0u;
++        bool gravada = false;
++    };
++    struct CensoVu1
++    {
++        std::unordered_map<uint64_t, VersaoCenso> versoes;
++        uint64_t ultimaGeracao = ~0ull;
++        const uint8_t *ultimoCodigo = nullptr;
++        uint64_t hashAtual = 0u;
++        std::chrono::steady_clock::time_point ultimaGravacao = std::chrono::steady_clock::now();
++    };
++    CensoVu1 g_censoVu1;
++
++    uint64_t hashCodigo(const uint8_t *dados, uint32_t tamanho)
++    {
++        uint64_t h = 1469598103934665603ull;
++        for (uint32_t i = 0; i < tamanho; ++i)
++            h = (h ^ dados[i]) * 1099511628211ull;
++        return h;
++    }
++
++    VersaoCenso &versaoDoCenso(const uint8_t *codigo, uint32_t tamanho, uint64_t geracao)
++    {
++        CensoVu1 &c = g_censoVu1;
++        if (geracao != c.ultimaGeracao || codigo != c.ultimoCodigo)
++        {
++            c.ultimaGeracao = geracao;
++            c.ultimoCodigo = codigo;
++            c.hashAtual = hashCodigo(codigo, tamanho);
++        }
++        VersaoCenso &v = c.versoes[c.hashAtual];
++        if (!v.gravada)
++        {
++            v.gravada = true;
++            char nome[64];
++            std::snprintf(nome, sizeof(nome), "ps2x_vu1_codigo_%016llx.bin", static_cast<unsigned long long>(c.hashAtual));
++            if (std::FILE *f = std::fopen(nome, "wb"))
++            {
++                std::fwrite(codigo, 1, tamanho, f);
++                std::fclose(f);
++            }
++        }
++        return v;
++    }
++
++    void talvezGravarCenso()
++    {
++        CensoVu1 &c = g_censoVu1;
++        const auto agora = std::chrono::steady_clock::now();
++        if (agora - c.ultimaGravacao < std::chrono::seconds(20))
++            return;
++        c.ultimaGravacao = agora;
++        std::FILE *f = std::fopen("ps2x_vu1_censo.txt", "w");
++        if (!f)
++            return;
++        for (const auto &item : c.versoes)
++        {
++            const VersaoCenso &v = item.second;
++            std::fprintf(f, "versao %016llx pares %llu chamadas %llu%c", static_cast<unsigned long long>(item.first),
++                         static_cast<unsigned long long>(v.total), static_cast<unsigned long long>(v.chamadas), 10);
++            for (const auto &e : v.entradas)
++                std::fprintf(f, "entrada %016llx %x %llu%c", static_cast<unsigned long long>(item.first), e.first, static_cast<unsigned long long>(e.second), 10);
++            for (uint32_t i = 0; i < v.pares.size(); ++i)
++                if (v.pares[i] != 0u)
++                    std::fprintf(f, "par %016llx %x %llu%c", static_cast<unsigned long long>(item.first), i * 8u, static_cast<unsigned long long>(v.pares[i]), 10);
++            for (const auto &a : v.arestas)
++                std::fprintf(f, "aresta %016llx %x %x %llu%c", static_cast<unsigned long long>(item.first), static_cast<uint32_t>(a.first >> 32),
++                             static_cast<uint32_t>(a.first), static_cast<unsigned long long>(a.second), 10);
++        }
++        std::fclose(f);
++    }
+ }
+ 
+ void VU1Interpreter::resetScheduler()
+@@ -1769,6 +1854,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const auto instanteInicial = g_vuStatLigado ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     if (m_cycle < budgetEnd && !m_stopRequested)
+         commitReadyPipelines();
++    VersaoCenso *censo = nullptr;
++    if (g_vu1CensoLigado && m_unit == Unit::VU1 && memory != nullptr && vuCode == memory->getVU1Code())
++    {
++        censo = &versaoDoCenso(vuCode, codeSize, memory->getVU1CodeGeneration());
++        ++censo->chamadas;
++        ++censo->entradas[m_state.pc];
++    }
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         if (m_state.pc + 8u > codeSize)
+@@ -1979,6 +2071,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             }
+         }
+ 
++        if (censo)
++        {
++            if (paresPc / 8u < censo->pares.size())
++                ++censo->pares[paresPc / 8u];
++            ++censo->total;
++            if (m_state.pc != paresPc + 8u)
++                ++censo->arestas[(static_cast<uint64_t>(paresPc) << 32) | m_state.pc];
++        }
++
+         const bool dHalt = decoded.dBit && m_state.dBitEnabled;
+         const bool tHalt = decoded.tBit && m_state.tBitEnabled;
+         const bool haltBit = dHalt || tHalt;
+@@ -2024,6 +2125,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         m_pendingHaltT = false;
+     }
+     m_state.cycles = m_cycle;
++    if (censo)
++        talvezGravarCenso();
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
+     if (g_vuStatLigado)

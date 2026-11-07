@@ -128,10 +128,17 @@ def montar():
     os.makedirs(runner, exist_ok=True)
     n = 0
     for a in os.listdir(GEN):
+        if os.path.isdir(os.path.join(GEN, a)):
+            continue
         dest = inc if a.endswith(".h") else runner
         shutil.copy2(os.path.join(GEN, a), os.path.join(dest, a))
         n += 1
     print(f"{n} arquivos gerados copiados para {STAGE}")
+    # Blocos traduzidos do VU1 (tools/vu1_tradutor.py); sem eles fica o stub do patch, que nao traduz nada.
+    traduzido = os.path.join(GEN, "vu1", "ps2_vu1_traduzido.cpp")
+    if os.path.exists(traduzido):
+        shutil.copy2(traduzido, os.path.join(STAGE, "ps2xRuntime", "src", "lib", "vu", "ps2_vu1_traduzido.cpp"))
+        print("VU1: blocos traduzidos de generated/vu1/ps2_vu1_traduzido.cpp")
 
 
 def compilar(tipo):

@@ -1,0 +1,1137 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 67c8184..be61724 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -244,6 +244,16 @@ private:
+              uint8_t *vuData, uint32_t dataSize,
+              GS &gs, PS2Memory *memory, uint32_t maxCycles);
+ 
++    // Um par com o modelo de tempo completo (corpo do laco de run). Definido em src/lib/vu/ps2_vu1_passo.inl, que o
++    // interpretador e os blocos traduzidos (ps2_vu1_traduzido.cpp, struct Vu1Traduzido) incluem.
++    static constexpr int PassoContinua = 0;
++    static constexpr int PassoPara = 1;
++    static constexpr int PassoFim = 2;
++    friend struct Vu1Traduzido;
++    inline int passoPar(const DecodedInstructionPair &decoded,
++                 uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,
++                 uint32_t codeSize, uint64_t budgetEnd);
++
+     InstructionUsage decodeUpperUsage(uint32_t upper) const;
+     InstructionUsage decodeLowerUsage(uint32_t lower) const;
+     static void addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
+@@ -283,8 +293,8 @@ private:
+     void flushPipelines();
+     void progressXgkick();
+     void finishXgkick();
+-    uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
+-    void markPairWrites(const DecodedInstructionPair &decoded);
++    inline uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
++    inline void markPairWrites(const DecodedInstructionPair &decoded);
+     bool pipelinesPending() const;
+ 
+     float normalizeOperand(float value) const;
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 9347c3e..e5bc752 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -396,6 +396,7 @@ add_library(ps2_runtime STATIC
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+     src/lib/vu/ps2_vu1_lower.cpp
++    src/lib/vu/ps2_vu1_traduzido.cpp
+     src/lib/games_database.cpp
+ )
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 3a144c7..57f1db1 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -7,8 +7,13 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ps2_memory.h"
+ #include "ps2_vu1_detail.h"
++#include "ps2_vu1_passo.inl"
++#include "ps2_vu1_traduzido.h"
++
++extern const bool g_ps2xVuEscritaImediata = std::getenv("PS2X_VU_FILAS") == nullptr;
+ 
+ #include <optional>
++#include <memory>
+ #include <map>
+ #include <unordered_map>
+ #include <vector>
+@@ -89,6 +94,22 @@ namespace
+     };
+     MascarasPipeline g_mascarasPipeline[2];
+ 
++    // PS2X_VU1_VERIFICA=N confere 1 em cada N execucoes de bloco traduzido contra o interpretador (copia silenciosa, sem
++    // envio ao GS). Divergencias saem como [vu1-verifica]; o resumo vai na linha [vu-stat].
++    const uint32_t g_vu1VerificaPasso = []
++    {
++        const char *env = std::getenv("PS2X_VU1_VERIFICA");
++        return env ? static_cast<uint32_t>(std::max(1, std::atoi(env))) : 0u;
++    }();
++    struct EstatisticaTraducao
++    {
++        uint64_t pares = 0u, blocos = 0u, conferidos = 0u, divergencias = 0u, contador = 0u;
++    };
++    EstatisticaTraducao g_traducao;
++    // PS2X_VU_STAT: pares interpretados com uma tabela traduzida ativa (PC fora da traducao), por PC.
++    uint64_t g_foraDaTraducao[2048]{};
++    uint64_t g_semTabelaPares = 0u, g_semTabelaChamadas = 0u, g_semTabelaCenso = 0u, g_semTabelaMemoria = 0u;
++
+     // Debug aid: PS2X_VU_STAT=1 imprime a cada ~5 s, por unidade: chamadas de run, ciclos, pares executados e tempo dentro de run.
+     struct EstatisticaVu
+     {
+@@ -110,7 +131,6 @@ namespace
+     // Toda leitura dessas registradoras ja para ate o "pronto em" (m_vfReady/m_viReady/m_accReady, que continuam iguais),
+     // entao nenhuma leitura com parada ve diferenca. Flags, Q, P e stores continuam com atraso (sao lidos sem parada).
+     // PS2X_VU_FILAS=1 volta ao modelo antigo, com as filas de escrita, para comparar.
+-    const bool g_vuEscritaImediata = std::getenv("PS2X_VU_FILAS") == nullptr;
+ 
+     // Debug aid: PS2X_VU1_CENSO=1 conta, por versao do codigo do VU1 (hash dos 16 KB), os pares executados, os pontos de
+     // entrada e os desvios tomados (origem -> destino, ja depois do delay slot). Regrava ps2x_vu1_censo.txt a cada ~20 s e
+@@ -124,6 +144,7 @@ namespace
+         uint64_t total = 0u;
+         uint64_t chamadas = 0u;
+         bool gravada = false;
++        bool decodificadoGravado = false;
+     };
+     struct CensoVu1
+     {
+@@ -1174,122 +1195,7 @@ void VU1Interpreter::flushPipelines()
+         advanceOneCycle();
+ }
+ 
+-uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
+-{
+-    uint64_t ready = m_cycle;
+-    const InstructionUsage *usages[2] = {
+-        &decoded.upperUsage,
+-        &decoded.lowerUsage};
+-    for (const InstructionUsage *usage : usages)
+-    {
+-        if (!usage)
+-            continue;
+-        // Na maioria dos pares nada esta pendente: o bit 63 de (ciclo - pronto) so liga se pronto > ciclo, sem desvio por componente.
+-        // Entradas de vfRead nao usadas ficam {0, 0}: mascara zero, nao contam.
+-        uint64_t pendente = 0u;
+-        for (uint32_t index = 0; index < usage->vfRead.size(); ++index)
+-        {
+-            const VfAccess &access = usage->vfRead[index];
+-            const std::array<uint64_t, 4> &prontos = m_vfReady[access.reg];
+-            const uint64_t lanes = access.lanes;
+-            pendente |= (m_cycle - prontos[0]) & (0u - ((lanes >> 3) & 1u));
+-            pendente |= (m_cycle - prontos[1]) & (0u - ((lanes >> 2) & 1u));
+-            pendente |= (m_cycle - prontos[2]) & (0u - ((lanes >> 1) & 1u));
+-            pendente |= (m_cycle - prontos[3]) & (0u - (lanes & 1u));
+-        }
+-        if ((pendente >> 63) != 0u)
+-        {
+-            for (uint32_t index = 0; index < usage->vfReadCount; ++index)
+-            {
+-                const VfAccess &access = usage->vfRead[index];
+-                for (uint32_t component = 0; component < 4u; ++component)
+-                {
+-                    if ((access.lanes & laneForComponent(component)) != 0u)
+-                        ready = std::max(ready, m_vfReady[access.reg][component]);
+-                }
+-            }
+-        }
+-        if ((usage->viRead & ~1u) != 0u)
+-        {
+-            for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-            {
+-                if ((usage->viRead & (1u << reg)) != 0u)
+-                    ready = std::max(ready, m_viReady[reg]);
+-            }
+-        }
+-        if (usage->accRead != 0u)
+-        {
+-            for (uint32_t component = 0; component < 4u; ++component)
+-            {
+-                if ((usage->accRead & laneForComponent(component)) != 0u)
+-                    ready = std::max(ready, m_accReady[component]);
+-            }
+-        }
+-    }
+-
+-    if (decoded.lowerUsage.pipeline == PipelineFdiv && m_fdiv.valid)
+-        ready = std::max(ready, m_fdiv.readyCycle);
+-    if (decoded.lowerUsage.pipeline == PipelineEfu)
+-        ready = std::max(ready, m_efuResourceReady);
+-    if (decoded.lowerUsage.waitQ && m_fdiv.valid)
+-        ready = std::max(ready, m_fdiv.readyCycle);
+-    if (decoded.lowerUsage.waitP)
+-    {
+-        for (const ScalarPipelineEntry &entry : m_efu)
+-            if (entry.valid)
+-                ready = std::max(ready, entry.readyCycle);
+-    }
+-    if (decoded.lowerUsage.pipeline == PipelineXgkick && m_xgkick.active)
+-        ready = std::max(ready, m_cycle + 1u);
+-    return ready;
+-}
+-
+-void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+-{
+-    const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+-    if (lowerWrite.reg != 0u &&
+-        decoded.suppressedLowerVf != lowerWrite.reg)
+-    {
+-        const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
+-                                     ? decoded.lowerUsage.vfLatency
+-                                     : decoded.lowerUsage.latency;
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            if ((lowerWrite.lanes & laneForComponent(component)) != 0u)
+-                m_vfReady[lowerWrite.reg][component] = m_cycle + latency;
+-        }
+-    }
+ 
+-    const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+-    if (upperWrite.reg != 0u)
+-    {
+-        const uint32_t latency = decoded.upperUsage.vfLatency != 0u
+-                                     ? decoded.upperUsage.vfLatency
+-                                     : decoded.upperUsage.latency;
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            if ((upperWrite.lanes & laneForComponent(component)) != 0u)
+-                m_vfReady[upperWrite.reg][component] = m_cycle + latency;
+-        }
+-    }
+-
+-    if ((decoded.lowerUsage.viWrite & ~1u) != 0u)
+-    {
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-        {
+-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-                m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+-        }
+-    }
+-    if (decoded.upperUsage.accWrite != 0u)
+-    {
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
+-                m_accReady[component] = m_cycle + kAccForwardLatency;
+-        }
+-    }
+-}
+ 
+ VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper) const
+ {
+@@ -1860,12 +1766,171 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         censo = &versaoDoCenso(vuCode, codeSize, memory->getVU1CodeGeneration());
+         ++censo->chamadas;
+         ++censo->entradas[m_state.pc];
++        if (!censo->decodificadoGravado)
++        {
++            // Para tools/vu1_tradutor.py: cada par decodificado como inicializador de DecodedInstructionPair.
++            censo->decodificadoGravado = true;
++            char nome[64];
++            std::snprintf(nome, sizeof(nome), "ps2x_vu1_decod_%016llx.txt", static_cast<unsigned long long>(g_censoVu1.hashAtual));
++            if (std::FILE *f = std::fopen(nome, "w"))
++            {
++                const auto uso = [f](const InstructionUsage &u)
++                {
++                    std::fprintf(f, "{{{{%u,%u},{%u,%u}}},{%u,%u},%u,%u,%u,%u,%u,%u,%u,%u,P(%u),%d,%d,%d,%d,%d,%d}",
++                                 u.vfRead[0].reg, u.vfRead[0].lanes, u.vfRead[1].reg, u.vfRead[1].lanes, u.vfWrite.reg, u.vfWrite.lanes,
++                                 u.vfReadCount, u.viRead, u.viWrite, u.accRead, u.accWrite, u.latency, u.vfLatency, u.viLatency,
++                                 static_cast<unsigned>(u.pipeline), u.waitQ, u.waitP, u.readsClip, u.writesClip, u.delaysNextBranchRead, u.reserved);
++                };
++                for (uint32_t pc = 0; pc + 8u <= codeSize && pc / 8u < kMaxDecodedPairs; pc += 8u)
++                {
++                    const DecodedInstructionPair d = decodeInstructionPair(vuCode, pc);
++                    std::fprintf(f, "%x {0x%08xu,0x%08xu,", pc, d.lower, d.upper);
++                    uso(d.lowerUsage);
++                    std::fputc(',', f);
++                    uso(d.upperUsage);
++                    std::fprintf(f, ",%d,%d,%d,%d,%d,%u,%u}%c", d.iBit, d.eBit, d.mBit, d.dBit, d.tBit, d.upperVfShadowReg, d.suppressedLowerVf, 10);
++                }
++                std::fclose(f);
++            }
++        }
+     }
++    const Vu1Traduzido::Bloco *tabela = nullptr;
++    if (censo == nullptr && m_unit == Unit::VU1 && memory != nullptr && vuCode == memory->getVU1Code())
++        tabela = Vu1Traduzido::tabelaAtual(vuCode, codeSize, memory->getVU1CodeGeneration());
++    if (tabela == nullptr && m_unit == Unit::VU1)
++    {
++        ++g_semTabelaChamadas;
++        if (censo != nullptr)
++            ++g_semTabelaCenso;
++        if (memory == nullptr || vuCode != memory->getVU1Code())
++            ++g_semTabelaMemoria;
++    }
++    Vu1Traduzido::Contexto contexto{vuData, dataSize, &gs, memory, codeSize, budgetEnd, 0u};
++    // Conferencia de um bloco traduzido (PS2X_VU1_VERIFICA): refaz os mesmos pares numa copia e compara o estado.
++    const auto conferirBlocoTraduzido = [&](VU1Interpreter &ref, std::vector<uint8_t> &dadosRef, const MascarasPipeline &mascarasAntes,
++                                            uint32_t pcBloco, uint64_t pares, int resultado)
++    {
++        const auto igual = [](const void *a, const void *b, size_t n) { return std::memcmp(a, b, n) == 0; };
++        const MascarasPipeline mascarasReal = g_mascarasPipeline[1];
++        g_mascarasPipeline[1] = mascarasAntes;
++        ref.m_activeVuData = dadosRef.data();
++        ref.m_activeVuDataSize = dataSize;
++        ref.m_activeMemory = nullptr;
++        ref.m_activeGs = nullptr;
++        const char *problema = nullptr;
++        for (uint64_t i = 0; i < pares && problema == nullptr; ++i)
++        {
++            const DecodedInstructionPair d = ref.decodeInstructionPair(vuCode, ref.m_state.pc);
++            const int r = ref.passoPar(d, dadosRef.data(), dataSize, gs, memory, codeSize, budgetEnd);
++            if (r != (i + 1 == pares && resultado == PassoFim ? PassoFim : PassoContinua))
++                problema = "resultado de passo";
++        }
++        if (problema == nullptr && resultado == PassoPara)
++        {
++            const DecodedInstructionPair d = ref.decodeInstructionPair(vuCode, ref.m_state.pc);
++            if (ref.passoPar(d, dadosRef.data(), dataSize, gs, memory, codeSize, budgetEnd) != PassoPara)
++                problema = "parada";
++        }
++        const MascarasPipeline mascarasRef = g_mascarasPipeline[1];
++        g_mascarasPipeline[1] = mascarasReal;
++
++        if (problema == nullptr)
++        {
++            if (!igual(&m_state.vf, &ref.m_state.vf, sizeof(m_state.vf)))
++                problema = "vf";
++            else if (!igual(&m_state.vi, &ref.m_state.vi, sizeof(m_state.vi)))
++                problema = "vi";
++            else if (!igual(&m_state.acc, &ref.m_state.acc, sizeof(m_state.acc)))
++                problema = "acc";
++            else if (!igual(&m_state.q, &ref.m_state.q, sizeof(float) * 3u) || m_state.r != ref.m_state.r)
++                problema = "q/p/i/r";
++            else if (m_state.mac != ref.m_state.mac || m_state.status != ref.m_state.status || m_state.clip != ref.m_state.clip)
++                problema = "flags";
++            else if (m_state.pc != ref.m_state.pc || m_state.branchPending != ref.m_state.branchPending ||
++                     m_state.branchTarget != ref.m_state.branchTarget || m_state.branchDelay != ref.m_state.branchDelay ||
++                     m_state.ebit != ref.m_state.ebit || m_state.haltAfterDelaySlot != ref.m_state.haltAfterDelaySlot)
++                problema = "pc/desvio";
++            else if (m_cycle != ref.m_cycle)
++                problema = "ciclo";
++            else if (m_vfReady != ref.m_vfReady || m_viReady != ref.m_viReady || m_accReady != ref.m_accReady)
++                problema = "placar";
++            else if (m_fdiv.valid != ref.m_fdiv.valid || (m_fdiv.valid && (m_fdiv.readyCycle != ref.m_fdiv.readyCycle || !igual(&m_fdiv.value, &ref.m_fdiv.value, sizeof(float)))))
++                problema = "fdiv";
++            else if (m_efuResourceReady != ref.m_efuResourceReady || m_workingClip != ref.m_workingClip)
++                problema = "efu/clip";
++            else if (std::memcmp(&mascarasReal, &mascarasRef, sizeof(mascarasReal)) != 0)
++                problema = "mascaras";
++            else if (!igual(vuData, dadosRef.data(), dataSize))
++                problema = "memoria de dados";
++            else if (m_xgkick.active != ref.m_xgkick.active || m_xgkick.copiedBytes != ref.m_xgkick.copiedBytes ||
++                     !igual(m_xgkick.packet.data(), ref.m_xgkick.packet.data(), m_xgkick.copiedBytes))
++                problema = "xgkick";
++            else
++            {
++                for (uint32_t i = 0; i < kMaxFlagEntries && problema == nullptr; ++i)
++                {
++                    const FlagPipelineEntry &a = m_flagPipeline[i], &b = ref.m_flagPipeline[i];
++                    if (a.valid != b.valid || (a.valid && (a.readyCycle != b.readyCycle || a.mac != b.mac || a.status != b.status ||
++                                                           a.clip != b.clip || a.extraSticky != b.extraSticky)))
++                        problema = "fila de flags";
++                }
++                for (uint32_t i = 0; i < kMaxPendingStores && problema == nullptr; ++i)
++                {
++                    const PendingStore &a = m_storePipeline[i], &b = ref.m_storePipeline[i];
++                    if (a.valid != b.valid || (a.valid && (a.readyCycle != b.readyCycle || a.address != b.address || a.words != b.words)))
++                        problema = "fila de stores";
++                }
++            }
++        }
++        ++g_traducao.conferidos;
++        if (problema != nullptr)
++        {
++            ++g_traducao.divergencias;
++            if (g_traducao.divergencias <= 20u)
++                std::fprintf(stderr, "[vu1-verifica] divergencia em %s: bloco 0x%x, %llu pares, pc real 0x%x ref 0x%x, ciclo real %llu ref %llu%c",
++                             problema, pcBloco, static_cast<unsigned long long>(pares), m_state.pc, ref.m_state.pc,
++                             static_cast<unsigned long long>(m_cycle), static_cast<unsigned long long>(ref.m_cycle), 10);
++        }
++    };
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
++        // Bloco traduzido para esta versao do codigo e este PC: executa ate sair do caminho previsto.
++        if (tabela != nullptr && (m_state.pc & 7u) == 0u)
++        {
++            if (const Vu1Traduzido::Bloco bloco = tabela[m_state.pc / 8u])
++            {
++                contexto.pares = 0u;
++                const uint32_t pcBloco = m_state.pc;
++                const bool conferir = g_vu1VerificaPasso != 0u && (++g_traducao.contador % g_vu1VerificaPasso) == 0u;
++                std::unique_ptr<VU1Interpreter> referencia;
++                std::vector<uint8_t> dadosReferencia;
++                MascarasPipeline mascarasAntes{};
++                if (conferir)
++                {
++                    referencia = std::make_unique<VU1Interpreter>(*this);
++                    dadosReferencia.assign(vuData, vuData + dataSize);
++                    mascarasAntes = g_mascarasPipeline[1];
++                }
++                const int resultado = bloco(*this, contexto);
++                paresExecutados += contexto.pares;
++                g_traducao.pares += contexto.pares;
++                ++g_traducao.blocos;
++                if (conferir)
++                    conferirBlocoTraduzido(*referencia, dadosReferencia, mascarasAntes, pcBloco, contexto.pares, resultado);
++                if (resultado == PassoFim)
++                {
++                    programEnded = true;
++                    break;
++                }
++                if (resultado == PassoPara)
++                    break;
++                continue;
++            }
++        }
++
+         // Caminho comum: referencia direta ao cache, sem copiar a estrutura. A geracao e conferida abaixo, como em getDecodedInstructionPairForPc.
+         const bool medeFase = g_vuFaseLigado;
+         uint64_t marca = medeFase ? __rdtsc() : 0u;
+@@ -1889,187 +1954,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (!cacheDireto)
+             decodedCopia = getDecodedInstructionPairForPc(vuCode, codeSize, memory, paresPc);
+         const DecodedInstructionPair &decoded = cacheDireto ? m_decodedCodeCache[paresPc / 8u] : *decodedCopia;
+-        if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+-        {
+-            reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+-            break;
+-        }
+ 
++        if (tabela != nullptr && g_vuStatLigado && paresPc / 8u < 2048u)
++            ++g_foraDaTraducao[paresPc / 8u];
++        else if (tabela == nullptr && m_unit == Unit::VU1)
++            ++g_semTabelaPares;
+         fecha(0);
+-        uint64_t readyCycle = calculatePairReadyCycle(decoded);
+-        while (readyCycle > m_cycle)
+-        {
+-            if (readyCycle >= budgetEnd)
+-            {
+-                advanceTo(budgetEnd);
+-                break;
+-            }
+-            advanceTo(readyCycle);
+-            readyCycle = calculatePairReadyCycle(decoded);
+-        }
+-        if (m_cycle >= budgetEnd)
+-            break;
+-
++        const int resultado = passoPar(decoded, vuData, dataSize, gs, memory, codeSize, budgetEnd);
+         fecha(1);
+-        uint8_t writtenVi = 0u;
+-        int32_t oldVi = 0;
+-        for (uint32_t reg = 1; reg < 16u && (decoded.lowerUsage.viWrite & ~1u) != 0u; ++reg)
+-        {
+-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            {
+-                writtenVi = static_cast<uint8_t>(reg);
+-                oldVi = m_state.vi[reg];
+-                break;
+-            }
+-        }
+-
+-        const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+-        const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+-        const bool hasUpperWrite = upperWrite.reg != 0u;
+-        const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
+-        const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
+-        float oldUpperVf[4]{};
+-        float newUpperVf[4]{};
+-        float oldLowerVf[4]{};
+-        float newLowerVf[4]{};
+-        float oldAcc[4]{};
+-        float newAcc[4]{};
+-        if (hasUpperWrite)
+-            std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+-        if (hasDistinctLowerWrite)
+-            std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+-        if (decoded.upperUsage.accWrite != 0u)
+-            std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
+-
+-        fecha(2);
+-        if (decoded.iBit)
+-        {
+-            execUpper(decoded.upper);
+-            float immediate = 0.0f;
+-            std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
+-            m_state.i = normalizeOperand(immediate);
+-        }
+-        else if (decoded.upperVfShadowReg != 0u)
+-        {
+-            float oldVf[4]{};
+-            float upperVf[4]{};
+-            std::memcpy(oldVf,
+-                        m_state.vf[decoded.upperVfShadowReg],
+-                        sizeof(oldVf));
+-            execUpper(decoded.upper);
+-            std::memcpy(upperVf,
+-                        m_state.vf[decoded.upperVfShadowReg],
+-                        sizeof(upperVf));
+-            std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+-                        oldVf,
+-                        sizeof(oldVf));
+-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+-            std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+-                        upperVf,
+-                        sizeof(upperVf));
+-        }
+-        else
+-        {
+-            execUpper(decoded.upper);
+-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+-        }
+-
+-        fecha(3);
+-        m_viBranchBackupValid = false;
+-
+-        if (g_vuEscritaImediata)
+-        {
+-            // Mesmo valor final que a fila gravaria: o novo nas pistas enfileiradas, o antigo nas demais.
+-            if (hasUpperWrite)
+-            {
+-                for (uint32_t component = 0; component < 4u; ++component)
+-                    if ((upperWrite.lanes & laneForComponent(component)) == 0u)
+-                        m_state.vf[upperWrite.reg][component] = oldUpperVf[component];
+-            }
+-            if (hasDistinctLowerWrite)
+-            {
+-                for (uint32_t component = 0; component < 4u; ++component)
+-                    if ((lowerWrite.lanes & laneForComponent(component)) == 0u)
+-                        m_state.vf[lowerWrite.reg][component] = oldLowerVf[component];
+-            }
+-            if (decoded.upperUsage.accWrite != 0u)
+-            {
+-                for (uint32_t component = 0; component < 4u; ++component)
+-                    if ((decoded.upperUsage.accWrite & laneForComponent(component)) == 0u)
+-                        m_state.acc[component] = oldAcc[component];
+-            }
+-            if (writtenVi != 0u)
+-                m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
+-        }
+-        else
+-        {
+-        if (hasUpperWrite)
+-        {
+-            std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
+-            std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
+-            const uint32_t latency =
+-                decoded.upperUsage.vfLatency != 0u
+-                    ? decoded.upperUsage.vfLatency
+-                    : decoded.upperUsage.latency;
+-            queueVfWrite(upperWrite.reg, upperWrite.lanes, newUpperVf, latency);
+-        }
+-        if (hasDistinctLowerWrite)
+-        {
+-            std::memcpy(newLowerVf, m_state.vf[lowerWrite.reg], sizeof(newLowerVf));
+-            std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
+-            const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
+-                                         ? decoded.lowerUsage.vfLatency
+-                                         : decoded.lowerUsage.latency;
+-            queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
+-        }
+-        if (decoded.upperUsage.accWrite != 0u)
+-        {
+-            std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
+-            std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
+-            // ACC is forwarded to the next upper instruction. Its arithmetic
+-            // flags still use the normal four-cycle FMAC timeline.
+-            queueAccWrite(decoded.upperUsage.accWrite, newAcc,
+-                          kAccForwardLatency);
+-        }
+-        if (writtenVi != 0u)
+-        {
+-            const int32_t newVi = m_state.vi[writtenVi];
+-            m_state.vi[writtenVi] = oldVi;
+-            const uint32_t latency =
+-                decoded.lowerUsage.viLatency != 0u
+-                    ? decoded.lowerUsage.viLatency
+-                    : decoded.lowerUsage.latency;
+-            queueViWrite(writtenVi, newVi, latency);
+-        }
+-        }
+-
+-        markPairWrites(decoded);
+-        if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+-            recordViWriteForBranch(writtenVi, oldVi);
+-
+-        m_state.vf[0][0] = 0.0f;
+-        m_state.vf[0][1] = 0.0f;
+-        m_state.vf[0][2] = 0.0f;
+-        m_state.vf[0][3] = 1.0f;
+-        m_state.vi[0] = 0;
+-
+-        uint32_t nextPc = m_state.pc + 8u;
+-        if (nextPc >= codeSize)
+-            nextPc = 0u;
+-        m_state.pc = nextPc;
+-
+-        if (m_state.branchPending)
+-        {
+-            if (m_state.branchDelay == 0u)
+-            {
+-                m_state.pc = m_state.branchTarget & microAddressMask();
+-                m_state.branchPending = false;
+-            }
+-            else
+-            {
+-                --m_state.branchDelay;
+-            }
+-        }
++        if (resultado == PassoPara)
++            break;
+ 
+         if (censo)
+         {
+@@ -2080,40 +1974,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 ++censo->arestas[(static_cast<uint64_t>(paresPc) << 32) | m_state.pc];
+         }
+ 
+-        const bool dHalt = decoded.dBit && m_state.dBitEnabled;
+-        const bool tHalt = decoded.tBit && m_state.tBitEnabled;
+-        const bool haltBit = dHalt || tHalt;
+-        const bool haltBranch = haltBit && decoded.lowerUsage.pipeline == PipelineBranch;
+-
+-        if (m_state.haltAfterDelaySlot)
+-        {
+-            m_state.stoppedByD = m_pendingHaltD;
+-            m_state.stoppedByT = m_pendingHaltT;
+-            programEnded = true;
+-        }
+-        else if (m_state.ebit)
+-            programEnded = true;
+-        else if (haltBit && !haltBranch)
++        ++paresExecutados;
++        if (resultado == PassoFim)
+         {
+-            m_state.stoppedByD = dHalt;
+-            m_state.stoppedByT = tHalt;
+             programEnded = true;
+-        }
+-        else if (decoded.eBit)
+-            m_state.ebit = true;
+-        else if (haltBranch)
+-        {
+-            m_state.haltAfterDelaySlot = true;
+-            m_pendingHaltD = dHalt;
+-            m_pendingHaltT = tHalt;
+-        }
+-
+-        ++paresExecutados;
+-        fecha(4);
+-        advanceOneCycle();
+-        fecha(5);
+-        if (programEnded)
+             break;
++        }
+     }
+ 
+     if (programEnded)
+@@ -2140,10 +2006,43 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (agora - e.inicio > std::chrono::seconds(5))
+         {
+             if (e.pares != 0u && g_vuFaseLigado)
+-                std::fprintf(stderr, "[vu-fase] unidade=%d ciclos_cpu_por_par busca=%.0f espera=%.0f preparo=%.0f exec=%.0f filas=%.0f avanco=%.0f%c",
++                std::fprintf(stderr, "[vu-fase] unidade=%d ciclos_cpu_por_par busca=%.0f par=%.0f (so pares interpretados)%c",
+                              m_unit == Unit::VU1 ? 1 : 0,
+-                             double(e.fase[0]) / e.pares, double(e.fase[1]) / e.pares, double(e.fase[2]) / e.pares,
+-                             double(e.fase[3]) / e.pares, double(e.fase[4]) / e.pares, double(e.fase[5]) / e.pares, 10);
++                             double(e.fase[0]) / e.pares, double(e.fase[1]) / e.pares, 10);
++            if (m_unit == Unit::VU1)
++                std::fprintf(stderr, "[vu1-traducao] pares=%llu blocos=%llu conferidos=%llu divergencias=%llu trocas_hash=%llu trocas_conteudo=%llu trocas_sem=%llu%c",
++                             static_cast<unsigned long long>(g_traducao.pares), static_cast<unsigned long long>(g_traducao.blocos),
++                             static_cast<unsigned long long>(g_traducao.conferidos), static_cast<unsigned long long>(g_traducao.divergencias),
++                             static_cast<unsigned long long>(Vu1Traduzido::s_porHash), static_cast<unsigned long long>(Vu1Traduzido::s_porConteudo),
++                             static_cast<unsigned long long>(Vu1Traduzido::s_semTraducao), 10);
++            if (m_unit == Unit::VU1)
++            {
++                uint64_t fora = 0u;
++                uint32_t piores[8]{};
++                for (uint32_t i = 0; i < 2048u; ++i)
++                {
++                    fora += g_foraDaTraducao[i];
++                    for (uint32_t k = 0; k < 8u; ++k)
++                        if (g_foraDaTraducao[i] > g_foraDaTraducao[piores[k]])
++                        {
++                            for (uint32_t j = 7u; j > k; --j)
++                                piores[j] = piores[j - 1u];
++                            piores[k] = i;
++                            break;
++                        }
++                }
++                std::fprintf(stderr, "[vu1-sem-tabela] chamadas=%llu pares=%llu censo=%llu memoria=%llu%c",
++                             static_cast<unsigned long long>(g_semTabelaChamadas), static_cast<unsigned long long>(g_semTabelaPares),
++                             static_cast<unsigned long long>(g_semTabelaCenso), static_cast<unsigned long long>(g_semTabelaMemoria), 10);
++                g_semTabelaChamadas = g_semTabelaPares = g_semTabelaCenso = g_semTabelaMemoria = 0u;
++                std::fprintf(stderr, "[vu1-fora] pares=%llu", static_cast<unsigned long long>(fora));
++                for (uint32_t k = 0; k < 8u; ++k)
++                    std::fprintf(stderr, " %x:%llu", piores[k] * 8u, static_cast<unsigned long long>(g_foraDaTraducao[piores[k]]));
++                std::fputc(10, stderr);
++                std::memset(g_foraDaTraducao, 0, sizeof(g_foraDaTraducao));
++                // So na impressao do VU1: a do VU0 zerava estes contadores no meio da janela do VU1.
++                g_traducao.pares = g_traducao.blocos = 0u;
++            }
+             std::fprintf(stderr, "[vu-stat] unidade=%d chamadas=%llu ciclos=%llu pares=%llu dentro_ms=%lld gif_ms=%lld envios=%llu total_ms=%lld\n",
+                          m_unit == Unit::VU1 ? 1 : 0,
+                          static_cast<unsigned long long>(e.chamadas),
+@@ -2157,3 +2056,31 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+     }
+ }
++
++uint64_t Vu1Traduzido::s_porHash = 0u;
++uint64_t Vu1Traduzido::s_porConteudo = 0u;
++uint64_t Vu1Traduzido::s_semTraducao = 0u;
++
++const Vu1Traduzido::Bloco *Vu1Traduzido::tabelaAtual(const uint8_t *codigo, uint32_t tamanho, uint64_t geracao)
++{
++    // Os blocos traduzidos so implementam a escrita imediata: com PS2X_VU_FILAS=1 o interpretador faz tudo.
++    static const bool desligada = std::getenv("PS2X_VU1_SEM_TRADUCAO") != nullptr || !g_ps2xVuEscritaImediata;
++    static uint64_t ultimaGeracao = ~0ull;
++    static const uint8_t *ultimoCodigo = nullptr;
++    static const Bloco *ultimaTabela = nullptr;
++    if (desligada)
++        return nullptr;
++    if (geracao != ultimaGeracao || codigo != ultimoCodigo)
++    {
++        ultimaGeracao = geracao;
++        ultimoCodigo = codigo;
++        ultimaTabela = tabelaPorHash(hashCodigo(codigo, tamanho));
++        if (ultimaTabela != nullptr)
++            ++s_porHash;
++        else if ((ultimaTabela = tabelaPorConteudo(codigo, tamanho)) != nullptr)
++            ++s_porConteudo;
++        else
++            ++s_semTraducao;
++    }
++    return ultimaTabela;
++}
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_passo.inl b/ps2xRuntime/src/lib/vu/ps2_vu1_passo.inl
+new file mode 100644
+index 0000000..17c84cf
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_passo.inl
+@@ -0,0 +1,345 @@
++// Um par de instrucoes do VU com o modelo de tempo completo: o corpo do laco de VU1Interpreter::run.
++// Incluido por ps2_vu1_core.cpp (interpretador) e por ps2_vu1_traduzido.cpp (blocos traduzidos), que passam o par ja
++// decodificado. Os dois caminhos executam exatamente o mesmo codigo; o traduzido so evita a busca no cache e o despacho.
++#ifndef PS2_VU1_PASSO_INL
++#define PS2_VU1_PASSO_INL
++
++#include "runtime/ps2_vu1.h"
++#include <cstring>
++
++// Definido em ps2_vu1_core.cpp: falso com PS2X_VU_FILAS=1 (modelo antigo, com as filas de escrita de VF/VI/ACC).
++extern const bool g_ps2xVuEscritaImediata;
++
++namespace vu1passo
++{
++    constexpr uint8_t pista(uint32_t component)
++    {
++        return static_cast<uint8_t>(1u << (3u - component));
++    }
++}
++
++#if defined(__GNUC__) || defined(__clang__)
++#define PS2_VU1_SEMPRE_EMBUTIR __attribute__((always_inline)) inline
++#else
++#define PS2_VU1_SEMPRE_EMBUTIR __forceinline
++#endif
++
++PS2_VU1_SEMPRE_EMBUTIR uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
++{
++    uint64_t ready = m_cycle;
++    const InstructionUsage *usages[2] = {
++        &decoded.upperUsage,
++        &decoded.lowerUsage};
++    for (const InstructionUsage *usage : usages)
++    {
++        if (!usage)
++            continue;
++        // Na maioria dos pares nada esta pendente: o bit 63 de (ciclo - pronto) so liga se pronto > ciclo, sem desvio por componente.
++        // Entradas de vfRead nao usadas ficam {0, 0}: mascara zero, nao contam.
++        uint64_t pendente = 0u;
++        for (uint32_t index = 0; index < usage->vfRead.size(); ++index)
++        {
++            const VfAccess &access = usage->vfRead[index];
++            const std::array<uint64_t, 4> &prontos = m_vfReady[access.reg];
++            const uint64_t lanes = access.lanes;
++            pendente |= (m_cycle - prontos[0]) & (0u - ((lanes >> 3) & 1u));
++            pendente |= (m_cycle - prontos[1]) & (0u - ((lanes >> 2) & 1u));
++            pendente |= (m_cycle - prontos[2]) & (0u - ((lanes >> 1) & 1u));
++            pendente |= (m_cycle - prontos[3]) & (0u - (lanes & 1u));
++        }
++        if ((pendente >> 63) != 0u)
++        {
++            for (uint32_t index = 0; index < usage->vfReadCount; ++index)
++            {
++                const VfAccess &access = usage->vfRead[index];
++                for (uint32_t component = 0; component < 4u; ++component)
++                {
++                    if ((access.lanes & vu1passo::pista(component)) != 0u)
++                        ready = std::max(ready, m_vfReady[access.reg][component]);
++                }
++            }
++        }
++        if ((usage->viRead & ~1u) != 0u)
++        {
++            for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
++            {
++                if ((usage->viRead & (1u << reg)) != 0u)
++                    ready = std::max(ready, m_viReady[reg]);
++            }
++        }
++        if (usage->accRead != 0u)
++        {
++            for (uint32_t component = 0; component < 4u; ++component)
++            {
++                if ((usage->accRead & vu1passo::pista(component)) != 0u)
++                    ready = std::max(ready, m_accReady[component]);
++            }
++        }
++    }
++
++    if (decoded.lowerUsage.pipeline == PipelineFdiv && m_fdiv.valid)
++        ready = std::max(ready, m_fdiv.readyCycle);
++    if (decoded.lowerUsage.pipeline == PipelineEfu)
++        ready = std::max(ready, m_efuResourceReady);
++    if (decoded.lowerUsage.waitQ && m_fdiv.valid)
++        ready = std::max(ready, m_fdiv.readyCycle);
++    if (decoded.lowerUsage.waitP)
++    {
++        for (const ScalarPipelineEntry &entry : m_efu)
++            if (entry.valid)
++                ready = std::max(ready, entry.readyCycle);
++    }
++    if (decoded.lowerUsage.pipeline == PipelineXgkick && m_xgkick.active)
++        ready = std::max(ready, m_cycle + 1u);
++    return ready;
++}
++
++PS2_VU1_SEMPRE_EMBUTIR void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
++{
++    const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
++    if (lowerWrite.reg != 0u &&
++        decoded.suppressedLowerVf != lowerWrite.reg)
++    {
++        const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
++                                     ? decoded.lowerUsage.vfLatency
++                                     : decoded.lowerUsage.latency;
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            if ((lowerWrite.lanes & vu1passo::pista(component)) != 0u)
++                m_vfReady[lowerWrite.reg][component] = m_cycle + latency;
++        }
++    }
++
++    const VfAccess upperWrite = decoded.upperUsage.vfWrite;
++    if (upperWrite.reg != 0u)
++    {
++        const uint32_t latency = decoded.upperUsage.vfLatency != 0u
++                                     ? decoded.upperUsage.vfLatency
++                                     : decoded.upperUsage.latency;
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            if ((upperWrite.lanes & vu1passo::pista(component)) != 0u)
++                m_vfReady[upperWrite.reg][component] = m_cycle + latency;
++        }
++    }
++
++    if ((decoded.lowerUsage.viWrite & ~1u) != 0u)
++    {
++        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
++        {
++            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
++                m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
++        }
++    }
++    if (decoded.upperUsage.accWrite != 0u)
++    {
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            if ((decoded.upperUsage.accWrite & vu1passo::pista(component)) != 0u)
++                m_accReady[component] = m_cycle + kAccForwardLatency;
++        }
++    }
++}
++
++// Devolve PassoContinua (par executado), PassoPara (orcamento, parada pedida, instrucao reservada; nada executado) ou
++// PassoFim (par executado e o programa terminou).
++PS2_VU1_SEMPRE_EMBUTIR int VU1Interpreter::passoPar(const DecodedInstructionPair &decoded,
++                                                    uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,
++                                                    uint32_t codeSize, uint64_t budgetEnd)
++{
++    if (m_cycle >= budgetEnd || m_stopRequested || m_state.pc + 8u > codeSize)
++        return PassoPara;
++    if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
++    {
++        reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
++        return PassoPara;
++    }
++
++    uint64_t readyCycle = calculatePairReadyCycle(decoded);
++    while (readyCycle > m_cycle)
++    {
++        if (readyCycle >= budgetEnd)
++        {
++            advanceTo(budgetEnd);
++            break;
++        }
++        advanceTo(readyCycle);
++        readyCycle = calculatePairReadyCycle(decoded);
++    }
++    if (m_cycle >= budgetEnd)
++        return PassoPara;
++
++    uint8_t writtenVi = 0u;
++    int32_t oldVi = 0;
++    for (uint32_t reg = 1; reg < 16u && (decoded.lowerUsage.viWrite & ~1u) != 0u; ++reg)
++    {
++        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
++        {
++            writtenVi = static_cast<uint8_t>(reg);
++            oldVi = m_state.vi[reg];
++            break;
++        }
++    }
++
++    const VfAccess upperWrite = decoded.upperUsage.vfWrite;
++    const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
++    const bool hasUpperWrite = upperWrite.reg != 0u;
++    const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
++    const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
++    float oldUpperVf[4]{};
++    float newUpperVf[4]{};
++    float oldLowerVf[4]{};
++    float newLowerVf[4]{};
++    float oldAcc[4]{};
++    float newAcc[4]{};
++    if (hasUpperWrite)
++        std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
++    if (hasDistinctLowerWrite)
++        std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++    if (decoded.upperUsage.accWrite != 0u)
++        std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
++
++    if (decoded.iBit)
++    {
++        execUpper(decoded.upper);
++        float immediate = 0.0f;
++        std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
++        m_state.i = normalizeOperand(immediate);
++    }
++    else if (decoded.upperVfShadowReg != 0u)
++    {
++        float oldVf[4]{};
++        float upperVf[4]{};
++        std::memcpy(oldVf, m_state.vf[decoded.upperVfShadowReg], sizeof(oldVf));
++        execUpper(decoded.upper);
++        std::memcpy(upperVf, m_state.vf[decoded.upperVfShadowReg], sizeof(upperVf));
++        std::memcpy(m_state.vf[decoded.upperVfShadowReg], oldVf, sizeof(oldVf));
++        execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++        std::memcpy(m_state.vf[decoded.upperVfShadowReg], upperVf, sizeof(upperVf));
++    }
++    else
++    {
++        execUpper(decoded.upper);
++        execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++    }
++
++    m_viBranchBackupValid = false;
++
++    if (g_ps2xVuEscritaImediata)
++    {
++        // Mesmo valor final que a fila gravaria: o novo nas pistas enfileiradas, o antigo nas demais.
++        if (hasUpperWrite)
++        {
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((upperWrite.lanes & vu1passo::pista(component)) == 0u)
++                    m_state.vf[upperWrite.reg][component] = oldUpperVf[component];
++        }
++        if (hasDistinctLowerWrite)
++        {
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((lowerWrite.lanes & vu1passo::pista(component)) == 0u)
++                    m_state.vf[lowerWrite.reg][component] = oldLowerVf[component];
++        }
++        if (decoded.upperUsage.accWrite != 0u)
++        {
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((decoded.upperUsage.accWrite & vu1passo::pista(component)) == 0u)
++                    m_state.acc[component] = oldAcc[component];
++        }
++        if (writtenVi != 0u)
++            m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
++    }
++    else
++    {
++        if (hasUpperWrite)
++        {
++            std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
++            std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
++            const uint32_t latency = decoded.upperUsage.vfLatency != 0u ? decoded.upperUsage.vfLatency : decoded.upperUsage.latency;
++            queueVfWrite(upperWrite.reg, upperWrite.lanes, newUpperVf, latency);
++        }
++        if (hasDistinctLowerWrite)
++        {
++            std::memcpy(newLowerVf, m_state.vf[lowerWrite.reg], sizeof(newLowerVf));
++            std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
++            const uint32_t latency = decoded.lowerUsage.vfLatency != 0u ? decoded.lowerUsage.vfLatency : decoded.lowerUsage.latency;
++            queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
++        }
++        if (decoded.upperUsage.accWrite != 0u)
++        {
++            std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
++            std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
++            // ACC is forwarded to the next upper instruction. Its arithmetic flags still use the normal four-cycle FMAC timeline.
++            queueAccWrite(decoded.upperUsage.accWrite, newAcc, kAccForwardLatency);
++        }
++        if (writtenVi != 0u)
++        {
++            const int32_t newVi = m_state.vi[writtenVi];
++            m_state.vi[writtenVi] = oldVi;
++            const uint32_t latency = decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency;
++            queueViWrite(writtenVi, newVi, latency);
++        }
++    }
++
++    markPairWrites(decoded);
++    if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
++        recordViWriteForBranch(writtenVi, oldVi);
++
++    m_state.vf[0][0] = 0.0f;
++    m_state.vf[0][1] = 0.0f;
++    m_state.vf[0][2] = 0.0f;
++    m_state.vf[0][3] = 1.0f;
++    m_state.vi[0] = 0;
++
++    uint32_t nextPc = m_state.pc + 8u;
++    if (nextPc >= codeSize)
++        nextPc = 0u;
++    m_state.pc = nextPc;
++
++    if (m_state.branchPending)
++    {
++        if (m_state.branchDelay == 0u)
++        {
++            m_state.pc = m_state.branchTarget & microAddressMask();
++            m_state.branchPending = false;
++        }
++        else
++        {
++            --m_state.branchDelay;
++        }
++    }
++
++    const bool dHalt = decoded.dBit && m_state.dBitEnabled;
++    const bool tHalt = decoded.tBit && m_state.tBitEnabled;
++    const bool haltBit = dHalt || tHalt;
++    const bool haltBranch = haltBit && decoded.lowerUsage.pipeline == PipelineBranch;
++
++    bool programEnded = false;
++    if (m_state.haltAfterDelaySlot)
++    {
++        m_state.stoppedByD = m_pendingHaltD;
++        m_state.stoppedByT = m_pendingHaltT;
++        programEnded = true;
++    }
++    else if (m_state.ebit)
++        programEnded = true;
++    else if (haltBit && !haltBranch)
++    {
++        m_state.stoppedByD = dHalt;
++        m_state.stoppedByT = tHalt;
++        programEnded = true;
++    }
++    else if (decoded.eBit)
++        m_state.ebit = true;
++    else if (haltBranch)
++    {
++        m_state.haltAfterDelaySlot = true;
++        m_pendingHaltD = dHalt;
++        m_pendingHaltT = tHalt;
++    }
++
++    advanceOneCycle();
++    return programEnded ? PassoFim : PassoContinua;
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_traduzido.h b/ps2xRuntime/src/lib/vu/ps2_vu1_traduzido.h
+new file mode 100644
+index 0000000..28e9ead
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_traduzido.h
+@@ -0,0 +1,47 @@
++// Blocos do VU1 traduzidos para C++ (gerados por tools/vu1_tradutor.py em generated/vu1/ps2_vu1_traduzido.cpp).
++// Cada versao do codigo do VU1 (hash FNV-1a dos 16 KB) tem uma tabela de 2048 entradas, uma por par: o bloco que comeca
++// naquele PC, ou nullptr. Cada bloco executa pares com VU1Interpreter::passoPar e o par ja decodificado como constante,
++// e volta ao interpretador quando o PC sai do caminho previsto. Sem tradução, tabelaAtual devolve nullptr.
++#ifndef PS2_VU1_TRADUZIDO_H
++#define PS2_VU1_TRADUZIDO_H
++
++#include <cstdint>
++
++class GS;
++class PS2Memory;
++class VU1Interpreter;
++
++struct Vu1Traduzido
++{
++    struct Contexto
++    {
++        uint8_t *vuData;
++        uint32_t dataSize;
++        GS *gs;
++        PS2Memory *memory;
++        uint32_t codeSize;
++        uint64_t budgetEnd;
++        uint64_t pares;
++    };
++    using Bloco = int (*)(VU1Interpreter &, Contexto &);
++
++    // Tabela da versao atual (recalcula o hash so quando a geracao muda). nullptr se a versao nao foi traduzida ou se
++    // PS2X_VU1_SEM_TRADUCAO estiver definida.
++    static const Bloco *tabelaAtual(const uint8_t *codigo, uint32_t tamanho, uint64_t geracao);
++
++    // Gerado: tabela de uma versao pelo hash, ou nullptr.
++    static const Bloco *tabelaPorHash(uint64_t hash);
++
++    // Gerado: primeira versao cujos pares traduzidos tem, todos, as mesmas palavras que o codigo atual. O resto da memoria
++    // (paginas que o programa nao usa) pode ter sobras de outros programas e mudar o hash sem mudar o que e executado.
++    static const Bloco *tabelaPorConteudo(const uint8_t *codigo, uint32_t tamanho);
++
++    // Contadores para [vu1-traducao]: trocas de codigo resolvidas pelo hash, pelo conteudo, ou sem traducao.
++    static uint64_t s_porHash, s_porConteudo, s_semTraducao;
++
++    // Gerado: uma especializacao por versao traduzida (membro, para ter o acesso de friend aos tipos do interpretador).
++    template <int N>
++    static int versao(VU1Interpreter &vu, Contexto &c);
++};
++
++#endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_traduzido.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_traduzido.cpp
+new file mode 100644
+index 0000000..18a9bf4
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_traduzido.cpp
+@@ -0,0 +1,13 @@
++// Sem traducao: tools/vu1_tradutor.py ainda nao gerou generated/vu1/ps2_vu1_traduzido.cpp
++// (tools/montar_runtime.py copia o arquivo gerado por cima deste).
++#include "ps2_vu1_traduzido.h"
++
++const Vu1Traduzido::Bloco *Vu1Traduzido::tabelaPorHash(uint64_t)
++{
++    return nullptr;
++}
++
++const Vu1Traduzido::Bloco *Vu1Traduzido::tabelaPorConteudo(const uint8_t *, uint32_t)
++{
++    return nullptr;
++}

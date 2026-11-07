@@ -35,6 +35,25 @@ Totais de instruções (classificação por campo, não é um disassembly comple
 - A contagem de instruções vem de campos de bits conferidos contra o disassembler open source do Gitaroo Man Native (MIT); não gerei listagem de disassembly.
 - Qual programa o jogo usa em cada cena (personagem, cenário, efeitos) ainda é desconhecido.
 
+## Census dinâmico (2026-11-06)
+Com `PS2X_VU1_CENSO=1` (patch 0033), o runtime conta, por versão do código do VU1 (hash dos 16 KB), os pares executados, as entradas e os desvios tomados. Ele grava `ps2x_vu1_censo.txt` e uma cópia de cada versão (`ps2x_vu1_codigo_<hash>.bin`) no diretório da rodada, nunca no repositório. O resumo sai com `tools/vu1_censo_dinamico.py <pasta>`.
+
+Rodada de 290 s (título, Eregion, filme e cena do jogo), com 408 milhões de pares em 7 versões:
+
+| Versão (hash) | Pares | Entradas principais | Blocos executados | 12 blocos mais quentes |
+|---|---|---|---|---|
+| `08a167d6…` | 34,3% | `4d0`, `2a8`, `460`, `268` | 82 | 94,2% |
+| `1a871f8c…` | 24,4% | `1ef8`, `1e68` | 87 | 93,5% |
+| `72b82386…` | 21,0% | `188`, `0`, `1ea8`, `1968`, `1b80` | 101 | 83,4% |
+| `61ad6251…` | 14,6% | `378`, `10`, `190`, `1f8` | 59 | 81,3% |
+| `697da831…` | 3,6% | `678`, `620` | 27 | — |
+
+O que isso mostra:
+- **Os laços quentes são minúsculos:** blocos de 1 a 9 pares, ligados por desvios condicionais. Um exemplo: `630-668` (8 pares) entra 5,5 milhões de vezes na rodada. É o processamento por vértice, com testes de recorte.
+- **Os `JR`/`JALR` executados têm poucos alvos** (1 a 9 por origem), todos registrados no census. Por exemplo, `de0` tem 9 alvos e `1c00` tem 4.
+- **O tempo exato é semântico:** nos laços quentes, ~14% dos pares leem as flags de recorte (`FCOR`/`FCAND`) e ~5-6% são `DIV`, mas `WAITQ` quase não aparece (0,07%). O código está em software pipelining: usa o Q anterior enquanto o próximo `DIV` corre e conta com os 4 ciclos de atraso das flags do `CLIP`. Uma tradução com tempo aproximado mudaria resultados.
+- Como os blocos são curtos, há valores em voo atravessando as fronteiras. Calcular as paradas só dentro do bloco, supondo o pipeline vazio na entrada, não é exato.
+
 ## Próximos passos sugeridos
 - Primeiro, interpretar o VU1 no runtime (o PS2Recomp já tem interpretador) e só depois liftar os programas mais quentes, guiado por census dinâmico.
 - Varrer a EE em busca de `MSCAL`/`MSCNT` (ids de entrada) e dos pacotes DMA que chamam cada MPG, para ligar programa → uso.
