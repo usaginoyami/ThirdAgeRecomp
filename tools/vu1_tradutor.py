@@ -19,6 +19,9 @@ import re
 import struct
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vu1_instrucoes  # noqa: E402
+
 
 # ---- modo explicito (v2): o modelo de tempo de passoPar resolvido para as constantes de cada par ----
 
@@ -79,6 +82,32 @@ def expressao_pronto(d):
     return termos, extra
 
 
+ESPECIALIZAR = True
+CONTAGEM = {'sup': 0, 'sup_total': 0, 'inf': 0, 'inf_total': 0}
+
+
+def exec_superior(u, w, recuo):
+    CONTAGEM['sup_total'] += 1
+    codigo = vu1_instrucoes.gera_superior(u) if ESPECIALIZAR else None
+    if codigo is None:
+        w(recuo + 'vu.execUpper(0x%08xu);' % u)
+        return
+    CONTAGEM['sup'] += 1
+    for linha in codigo:
+        w(recuo + linha)
+
+
+def exec_inferior(l, u, pc, w, recuo):
+    CONTAGEM['inf_total'] += 1
+    codigo = vu1_instrucoes.gera_inferior(l, pc) if ESPECIALIZAR else None
+    if codigo is None:
+        w(recuo + 'vu.execLower(0x%08xu, c.vuData, c.dataSize, *c.gs, c.memory, 0x%08xu);' % (l, u))
+        return
+    CONTAGEM['inf'] += 1
+    for linha in codigo:
+        w(recuo + linha)
+
+
 def gera_par(pc, d, w):
     lo, up = d['lo'], d['up']
     w('    // par 0x%x' % pc)
@@ -120,20 +149,20 @@ def gera_par(pc, d, w):
     if up['accWrite'] not in (0, 15):
         w('        float oldAcc[4]; std::memcpy(oldAcc, vu.m_state.acc, sizeof(oldAcc));')
     if d['iBit']:
-        w('        vu.execUpper(0x%08xu);' % d['upper'])
+        exec_superior(d['upper'], w, '        ')
         w('        { const uint32_t bits = 0x%08xu; std::memcpy(&vu.m_state.i, &bits, sizeof(bits)); }' % normaliza_operando(d['lower']))
     elif d['shadow']:
         s = d['shadow']
         w('        float sombra[4]; float novo[4];')
         w('        std::memcpy(sombra, vu.m_state.vf[%d], sizeof(sombra));' % s)
-        w('        vu.execUpper(0x%08xu);' % d['upper'])
+        exec_superior(d['upper'], w, '        ')
         w('        std::memcpy(novo, vu.m_state.vf[%d], sizeof(novo));' % s)
         w('        std::memcpy(vu.m_state.vf[%d], sombra, sizeof(sombra));' % s)
-        w('        vu.execLower(0x%08xu, c.vuData, c.dataSize, *c.gs, c.memory, 0x%08xu);' % (d['lower'], d['upper']))
+        exec_inferior(d['lower'], d['upper'], pc, w, '        ')
         w('        std::memcpy(vu.m_state.vf[%d], novo, sizeof(novo));' % s)
     else:
-        w('        vu.execUpper(0x%08xu);' % d['upper'])
-        w('        vu.execLower(0x%08xu, c.vuData, c.dataSize, *c.gs, c.memory, 0x%08xu);' % (d['lower'], d['upper']))
+        exec_superior(d['upper'], w, '        ')
+        exec_inferior(d['lower'], d['upper'], pc, w, '        ')
     w('        vu.m_viBranchBackupValid = false;')
     # Escrita imediata: pistas fora da mascara voltam ao valor antigo.
     if tem_up and ulanes != 15:
@@ -230,10 +259,13 @@ def main():
     ap.add_argument('pasta')
     ap.add_argument('saida')
     ap.add_argument('--minimo', type=float, default=0.5, help='%% minimo dos pares para traduzir uma versao')
+    ap.add_argument('--sem-especializar', action='store_true', help='modo explicito chamando sempre execUpper/execLower')
     ap.add_argument('--modo', choices=('explicito', 'passo'), default='explicito',
                     help='explicito: tempo resolvido por par (padrao); passo: passoPar embutido com o par constante')
     a = ap.parse_args()
 
+    global ESPECIALIZAR
+    ESPECIALIZAR = not a.sem_especializar
     versoes, entradas, pares, arestas = ler_censo(a.pasta)
     total = sum(versoes.values()) or 1
     escolhidas = []
@@ -257,6 +289,58 @@ def main():
     w('#include "ps2_vu1_traduzido.h"')
     w('#include <algorithm>')
     w('#include <cstring>')
+    w('')
+    w('#include <cmath>')
+    w('#include <limits>')
+    w('')
+    w('namespace')
+    w('{')
+    w('    // Copias de VU1Interpreter::normalizeOperand, de vuFloatToInt (ps2_vu1_upper.cpp) e do teste do CLIP.')
+    w('    inline float vuNorm(float value)')
+    w('    {')
+    w('        uint32_t bits = 0;')
+    w('        std::memcpy(&bits, &value, sizeof(bits));')
+    w('        const uint32_t exponent = (bits >> 23) & 0xFFu;')
+    w('        if (exponent == 0u)')
+    w('            bits &= 0x80000000u;')
+    w('        else if (exponent == 0xFFu)')
+    w('            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;')
+    w('        std::memcpy(&value, &bits, sizeof(value));')
+    w('        return value;')
+    w('    }')
+    w('    inline int32_t vuFloatToInt(float value, float scale)')
+    w('    {')
+    w('        const double scaled = static_cast<double>(value) * static_cast<double>(scale);')
+    w('        if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))')
+    w('            return std::numeric_limits<int32_t>::max();')
+    w('        if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))')
+    w('            return std::numeric_limits<int32_t>::min();')
+    w('        return static_cast<int32_t>(scaled);')
+    w('    }')
+    w('    inline uint32_t vuClip(const float *vs, float w)')
+    w('    {')
+    w('        uint32_t wBits = 0u;')
+    w('        std::memcpy(&wBits, &w, sizeof(wBits));')
+    w('        const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;')
+    w('        const auto excede = [limit](float value, uint32_t signMask)')
+    w('        {')
+    w('            uint32_t bits = 0u;')
+    w('            std::memcpy(&bits, &value, sizeof(bits));')
+    w('            bits ^= signMask;')
+    w('            int32_t ordered = 0;')
+    w('            std::memcpy(&ordered, &bits, sizeof(ordered));')
+    w('            return ordered > limit;')
+    w('        };')
+    w('        uint32_t flags = 0u;')
+    w('        if (excede(vs[0], 0x00000000u)) flags |= 0x01u;')
+    w('        if (excede(vs[0], 0x80000000u)) flags |= 0x02u;')
+    w('        if (excede(vs[1], 0x00000000u)) flags |= 0x04u;')
+    w('        if (excede(vs[1], 0x80000000u)) flags |= 0x08u;')
+    w('        if (excede(vs[2], 0x00000000u)) flags |= 0x10u;')
+    w('        if (excede(vs[2], 0x80000000u)) flags |= 0x20u;')
+    w('        return flags;')
+    w('    }')
+    w('}')
     w('')
     w('#define P(n) static_cast<VU1Interpreter::Pipeline>(n)')
     w('#define PAR(D, PROXIMO) \\')
@@ -380,6 +464,9 @@ def main():
     with open(a.saida, 'w', encoding='utf-8', newline='\n') as f:
         f.write('\n'.join(out) + '\n')
     print('%d versoes, %d pares traduzidos -> %s' % (len(escolhidas), total_pares, a.saida))
+    if a.modo == 'explicito':
+        print('instrucoes geradas direto: superiores %d de %d, inferiores %d de %d (o resto chama o interpretador)' %
+              (CONTAGEM['sup'], CONTAGEM['sup_total'], CONTAGEM['inf'], CONTAGEM['inf_total']))
 
 
 if __name__ == '__main__':
