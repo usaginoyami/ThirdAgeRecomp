@@ -1,0 +1,154 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c72407b..dda8e8d 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -4,6 +4,7 @@
+ #include "ps2_runtime_macros.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cassert>
+ #include <cstring>
+ #include <limits>
+@@ -102,6 +103,25 @@ namespace
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+ 
++    // O vblank segue so o relogio do PC, em vez de esperar tambem os ciclos estimados do EE (8 por despacho de funcao, que
++    // andam mais devagar que o console nas cenas pesadas). O som ja segue o relogio do PC. PS2X_VBLANK_REAL=0 volta ao anterior.
++    const bool g_vblankRelogio = []
++    {
++        const char *env = std::getenv("PS2X_VBLANK_REAL");
++        return !env || std::atoi(env) != 0;
++    }();
++    constexpr uint64_t kBaseCicloVblankRelogio = 1ull << 62; // nunca alcancado: o prazo em ciclos nao dispara o vblank
++    constexpr uint64_t kCiclosEntreConferencias = 16384u;    // a cada 2048 despachos olha o relogio
++    uint64_t g_proximaConferenciaVblank = 0u;
++    std::atomic<int64_t> g_hostProximoVblank{std::numeric_limits<int64_t>::max()};
++
++    template <typename Item>
++    bool vblankSoPeloRelogio(const Item &item)
++    {
++        using Tipo = decltype(item.event.type);
++        return g_vblankRelogio && (item.event.type == Tipo::VBlankStart || item.event.type == Tipo::VBlankEnd);
++    }
++
+     template <typename Map>
+     int allocatePositiveId(int &nextId, const Map &objects)
+     {
+@@ -194,7 +214,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     main.status = EeThreadStatus::Ready;
+     m_threads.emplace(main.id, std::move(main));
+     m_readyQueues[0].push_back(kMainThreadId);
+-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
++    scheduleEvent(g_vblankRelogio ? kBaseCicloVblankRelogio : m_eeCycle + kVBlankPeriodCycles,
+                   std::chrono::steady_clock::now() + kVBlankPeriod,
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
+     publishSnapshot();
+@@ -423,6 +443,16 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+         return true;
+     }
+ 
++    if (g_vblankRelogio && m_eeCycle >= g_proximaConferenciaVblank)
++    {
++        g_proximaConferenciaVblank = m_eeCycle + kCiclosEntreConferencias;
++        if (std::chrono::steady_clock::now().time_since_epoch().count() >= g_hostProximoVblank.load(std::memory_order_relaxed))
++        {
++            m_checkpointPending.store(true, std::memory_order_release);
++            return true;
++        }
++    }
++
+     if (m_eeCycle < m_sliceEndCycle)
+     {
+         return false;
+@@ -1841,7 +1871,8 @@ void EeScheduler::processDueDeadlines()
+             const auto now = std::chrono::steady_clock::now();
+             for (const ScheduledEvent &item : m_deadlines)
+             {
+-                if (item.deadlineCycle <= m_eeCycle &&
++                // Vblank pelo relogio: so entra quando ja venceu, para nunca fazer o EE dormir esperando por ele.
++                if ((vblankSoPeloRelogio(item) ? item.hostDeadline <= now : item.deadlineCycle <= m_eeCycle) &&
+                     (pacingDeadline == std::chrono::steady_clock::time_point{} ||
+                      item.hostDeadline < pacingDeadline))
+                 {
+@@ -1870,7 +1901,7 @@ void EeScheduler::processDueDeadlines()
+             const auto pacedNow = std::chrono::steady_clock::now();
+             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
+                                               [this, pacedNow](const ScheduledEvent &item)
+-                                              { return item.deadlineCycle <= m_eeCycle &&
++                                              { return (vblankSoPeloRelogio(item) || item.deadlineCycle <= m_eeCycle) &&
+                                                        item.hostDeadline <= pacedNow; });
+             due.insert(due.end(),
+                        std::make_move_iterator(m_deadlines.begin()),
+@@ -1925,6 +1956,27 @@ void EeScheduler::processEvent(const EeEvent &event)
+         break;
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
++        {
++            // PS2X_TEMPO_STAT=1: quantos vblanks e quanto tempo de console (pelos ciclos estimados) cabem em 5 s reais.
++            static const bool tempoStat = std::getenv("PS2X_TEMPO_STAT") != nullptr;
++            if (tempoStat)
++            {
++                static auto inicioJanela = std::chrono::steady_clock::now();
++                static uint64_t tickInicial = m_vsyncTick, cicloInicial = m_eeCycle;
++                const auto agora = std::chrono::steady_clock::now();
++                const double segundos = std::chrono::duration<double>(agora - inicioJanela).count();
++                if (segundos >= 5.0)
++                {
++                    std::fprintf(stderr, "[tempo] vblanks=%.1f/s ciclosEE=%.3f do console em %.2f s\n",
++                                 static_cast<double>(m_vsyncTick - tickInicial) / segundos,
++                                 static_cast<double>(m_eeCycle - cicloInicial) / static_cast<double>(kEeClockHz) / segundos, segundos);
++                    std::fflush(stderr);
++                    inicioJanela = agora;
++                    tickInicial = m_vsyncTick;
++                    cicloInicial = m_eeCycle;
++                }
++            }
++        }
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         if ((m_vsyncTick & 1u) != 0u)
+         {
+@@ -2074,6 +2126,10 @@ void EeScheduler::waitForEvent()
+         const auto next = std::min_element(m_deadlines.begin(), m_deadlines.end(),
+                                            [](const ScheduledEvent &left, const ScheduledEvent &right)
+                                            {
++                                               if (g_vblankRelogio && left.hostDeadline != right.hostDeadline)
++                                               {
++                                                   return left.hostDeadline < right.hostDeadline;
++                                               }
+                                                if (left.deadlineCycle != right.deadlineCycle)
+                                                {
+                                                    return left.deadlineCycle < right.deadlineCycle;
+@@ -2082,6 +2138,12 @@ void EeScheduler::waitForEvent()
+                                            });
+         deadlineCycle = next->deadlineCycle;
+         hostDeadline = next->hostDeadline;
++        if (deadlineCycle >= kBaseCicloVblankRelogio)
++        {
++            // Ocioso esperando um vblank pelo relogio: os ciclos avancam so o tempo real da espera.
++            const auto espera = std::chrono::duration_cast<std::chrono::microseconds>(hostDeadline - std::chrono::steady_clock::now()).count();
++            deadlineCycle = m_eeCycle + (espera > 0 ? microsecondsToEeCycles(static_cast<uint64_t>(espera)) : 0u);
++        }
+     }
+     if (hasTimerDeadline)
+     {
+@@ -2140,6 +2202,18 @@ void EeScheduler::updateNextDeadline()
+                                          return left.sequence < right.sequence;
+                                      });
+     m_nextDeadlineCycle.store(it->deadlineCycle, std::memory_order_release);
++    if (g_vblankRelogio)
++    {
++        int64_t proximo = std::numeric_limits<int64_t>::max();
++        for (const ScheduledEvent &item : m_deadlines)
++        {
++            if (vblankSoPeloRelogio(item))
++            {
++                proximo = std::min<int64_t>(proximo, item.hostDeadline.time_since_epoch().count());
++            }
++        }
++        g_hostProximoVblank.store(proximo, std::memory_order_relaxed);
++    }
+ }
+ 
+ bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
