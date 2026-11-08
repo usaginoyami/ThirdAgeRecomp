@@ -83,6 +83,9 @@ def expressao_pronto(d):
 
 
 ESPECIALIZAR = True
+# Avanco de ciclo embutido em cada par: medido mais lento (86,6 contra 76,8 ns por par com o verificador), pelo tamanho
+# do codigo. Fica a chamada a advanceOneCycle; --avanco-embutido liga para comparar.
+AVANCO_EMBUTIDO = False
 CONTAGEM = {'sup': 0, 'sup_total': 0, 'inf': 0, 'inf_total': 0}
 
 
@@ -222,7 +225,7 @@ def gera_par(pc, d, w):
         w('        else vu.m_state.ebit = true;')
     else:
         w('        else if (haltBranch) { vu.m_state.haltAfterDelaySlot = true; vu.m_pendingHaltD = dHalt; vu.m_pendingHaltT = tHalt; }')
-    w('        vu.advanceOneCycle();')
+    w('        avanca();' if ESPECIALIZAR and AVANCO_EMBUTIDO else '        vu.advanceOneCycle();')
     w('        ++c.pares;')
     w('        if (fim) return VU1Interpreter::PassoFim;')
     w('    }')
@@ -260,12 +263,14 @@ def main():
     ap.add_argument('saida')
     ap.add_argument('--minimo', type=float, default=0.5, help='%% minimo dos pares para traduzir uma versao')
     ap.add_argument('--sem-especializar', action='store_true', help='modo explicito chamando sempre execUpper/execLower')
+    ap.add_argument('--avanco-embutido', action='store_true', help='embute advanceOneCycle em cada par (mais lento)')
     ap.add_argument('--modo', choices=('explicito', 'passo'), default='explicito',
                     help='explicito: tempo resolvido por par (padrao); passo: passoPar embutido com o par constante')
     a = ap.parse_args()
 
-    global ESPECIALIZAR
+    global ESPECIALIZAR, AVANCO_EMBUTIDO
     ESPECIALIZAR = not a.sem_especializar
+    AVANCO_EMBUTIDO = a.avanco_embutido
     versoes, entradas, pares, arestas = ler_censo(a.pasta)
     total = sum(versoes.values()) or 1
     escolhidas = []
@@ -377,6 +382,9 @@ def main():
         if a.modo == 'passo':
             for pc in executados:
                 w('    static constexpr VU1Interpreter::DecodedInstructionPair d_%x = %s;' % (pc, decod[pc]))
+        if a.modo == 'explicito' and ESPECIALIZAR:
+            for linha in vu1_instrucoes.lambdas_versao():
+                w(linha)
         w('    int r = VU1Interpreter::PassoContinua;')
         w('    (void)r;')
         w('despacho:')

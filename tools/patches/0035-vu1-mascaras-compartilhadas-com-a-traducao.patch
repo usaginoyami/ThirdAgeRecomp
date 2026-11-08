@@ -1,0 +1,56 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 57f1db1..df6321f 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -11,6 +11,7 @@
+ #include "ps2_vu1_traduzido.h"
+ 
+ extern const bool g_ps2xVuEscritaImediata = std::getenv("PS2X_VU_FILAS") == nullptr;
++Ps2xMascarasPipeline g_ps2xMascarasPipeline[2];
+ 
+ #include <optional>
+ #include <memory>
+@@ -82,17 +83,9 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+ 
+ namespace
+ {
+-    // Um bit por entrada valida de cada fila. O commit percorre so as entradas ocupadas, na mesma ordem de indice.
+-    // Uma por unidade (so existem m_vu0 e m_vu1); fica aqui para nao mexer em ps2_vu1.h, incluido pelos 50 mil arquivos gerados.
+-    struct MascarasPipeline
+-    {
+-        uint32_t flag = 0u;
+-        uint32_t store = 0u;
+-        uint32_t vf = 0u;
+-        uint32_t vi = 0u;
+-        uint32_t acc = 0u;
+-    };
+-    MascarasPipeline g_mascarasPipeline[2];
++    // As mascaras ficam em ps2_vu1_passo.inl (g_ps2xMascarasPipeline), para os blocos traduzidos tambem as usarem.
++    using MascarasPipeline = Ps2xMascarasPipeline;
++    Ps2xMascarasPipeline *const g_mascarasPipeline = g_ps2xMascarasPipeline;
+ 
+     // PS2X_VU1_VERIFICA=N confere 1 em cada N execucoes de bloco traduzido contra o interpretador (copia silenciosa, sem
+     // envio ao GS). Divergencias saem como [vu1-verifica]; o resumo vai na linha [vu-stat].
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_passo.inl b/ps2xRuntime/src/lib/vu/ps2_vu1_passo.inl
+index 17c84cf..a617acc 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_passo.inl
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_passo.inl
+@@ -10,6 +10,18 @@
+ // Definido em ps2_vu1_core.cpp: falso com PS2X_VU_FILAS=1 (modelo antigo, com as filas de escrita de VF/VI/ACC).
+ extern const bool g_ps2xVuEscritaImediata;
+ 
++// Um bit por entrada valida de cada fila do VU (indice 0 = VU0, 1 = VU1). O commit percorre so as entradas ocupadas, na
++// mesma ordem de indice. Definido em ps2_vu1_core.cpp; os blocos traduzidos atualizam as mesmas mascaras.
++struct Ps2xMascarasPipeline
++{
++    uint32_t flag = 0u;
++    uint32_t store = 0u;
++    uint32_t vf = 0u;
++    uint32_t vi = 0u;
++    uint32_t acc = 0u;
++};
++extern Ps2xMascarasPipeline g_ps2xMascarasPipeline[2];
++
+ namespace vu1passo
+ {
+     constexpr uint8_t pista(uint32_t component)

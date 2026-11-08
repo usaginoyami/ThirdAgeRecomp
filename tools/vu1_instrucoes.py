@@ -30,12 +30,42 @@ def _fmac(u, destino_acc, formula):
     linhas.append('    float result[4];')
     for c in range(4):
         linhas.append('    result[%d] = %s;' % (c, formula(c)))
-    if destino_acc:
-        linhas.append('    vu.applyFmacDestAcc(result, %du);' % f['dest'])
-    else:
-        linhas.append('    vu.applyFmacDest(vu.m_state.vf[%d], result, %du);' % (f['fd'], f['dest']))
+    destino = 'vu.m_state.acc' if destino_acc else 'vu.m_state.vf[%d]' % f['fd']
+    linhas += ['    ' + l for l in aplica_fmac(u, f['dest'], destino)]
     linhas.append('}')
     return linhas
+
+
+def soma_de_produto(u):
+    """Mesma condicao de calculateFmacProductSticky: so estas instrucoes acumulam flags do produto."""
+    op = u & 0x3F
+    esp = ((u & 3) | ((u >> 4) & 0x7C)) if op >= 0x3C else 0xFF
+    return (0x08 <= op <= 0x0F or op in (0x21, 0x23, 0x25, 0x27, 0x29, 0x2D, 0x2E) or 0x08 <= esp <= 0x0F or
+            esp in (0x21, 0x23, 0x25, 0x27, 0x29, 0x2D))
+
+
+def aplica_fmac(u, dest, destino):
+    """applyFmacDest/applyFmacDestAcc: normalizeFmacResult (caminho rapido aqui; qualquer pista fora dele refaz todas pelo
+    interpretador), updateFmacFlags (lambda flagsFmac da versao) e applyDest."""
+    pistas = [c for c in range(4) if dest & PISTAS[c]]
+    linhas = ['uint8_t lf[4] = {0u, 0u, 0u, 0u};', 'bool lento = false;']
+    for c in pistas:
+        linhas.append('{ const float m = std::fabs(result[%d]); if (m >= 1.0e-30f && m <= 1.0e30f) lf[%d] = result[%d] < 0.0f ? 0x2u : 0u; else lento = true; }' % (c, c, c))
+    if pistas:
+        linhas.append('if (lento) vu.normalizeFmacResult(result, %du, lf);' % dest)
+        sticky = 'vu.calculateFmacProductSticky(%du)' % dest if soma_de_produto(u) else '0u'
+        linhas.append('flagsFmac(lf, %du, %s);' % (dest, sticky))
+    else:
+        linhas.append('(void)lento;')
+    linhas += _aplica(destino, dest, ['result[%d]' % c for c in range(4)])
+    return linhas
+
+
+def lambdas_versao():
+    """Copias, para o topo de cada funcao traduzida, de VU1Interpreter::updateFmacFlags e de advanceOneCycle (com
+    commitReadyPipelines). As filas de VF/VI/ACC so existem no modelo antigo (PS2X_VU_FILAS=1, sem traducao): se houver
+    alguma, o commit original faz o resto, na mesma ordem."""
+    return open(__file__.replace('vu1_instrucoes.py', 'vu1_lambdas.inc'), encoding='utf-8').read().rstrip('\n').split('\n')
 
 
 def _aplica(dst, dest, valores):
