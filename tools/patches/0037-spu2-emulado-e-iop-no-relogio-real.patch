@@ -1,0 +1,936 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index eb638e5..f76859b 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_library(ps2_iop STATIC
+     src/emulator/core/iop_cpu.cpp
+     src/emulator/core/iop_kernel.cpp
+     src/emulator/core/iop_memory.cpp
++    src/emulator/core/iop_spu2.cpp
+     src/emulator/services/iop_module_loader.cpp
+     src/emulator/services/iop_rpc.cpp
+     src/emulator/imports/iop_cdvd.cpp
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 974328f..28c20cc 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -8,6 +8,8 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#include "iop_spu2.h"
++
+ namespace ps2x::iop::detail
+ {
+     class IopMemory
+@@ -68,6 +70,8 @@ namespace ps2x::iop::detail
+         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
+ 
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
++        void avancarSpu2(uint64_t cicloIop) { m_spu2.avancar(cicloIop, m_ram.data(), RamSize); }
++        [[nodiscard]] uint32_t takeIrqsSpu2() noexcept { return m_spu2.takeIrqs(); }
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+ 
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+@@ -87,5 +91,6 @@ namespace ps2x::iop::detail
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
+         std::optional<DmaStart> m_dmaStart;
++        mutable IopSpu2 m_spu2;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 4f2608e..0b665ba 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -31,6 +31,7 @@ namespace ps2x::iop::detail
+         std::fill(m_owned.begin(), m_owned.end(), uint8_t{0});
+         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
+         m_hardware.clear();
++        m_spu2.reset();
+         m_allocations.clear();
+         m_heapCursor = HeapBase;
+         m_interruptStatus = 0;
+@@ -58,6 +59,8 @@ namespace ps2x::iop::detail
+     uint16_t IopMemory::read16(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End)
++            return m_spu2.read16(phys & ~1u);
+         if (phys + 1u < RamSize)
+         {
+             uint16_t value;
+@@ -70,6 +73,8 @@ namespace ps2x::iop::detail
+     uint32_t IopMemory::read32(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End)
++            return static_cast<uint32_t>(m_spu2.read16(phys & ~1u)) | (static_cast<uint32_t>(m_spu2.read16((phys & ~1u) + 2u)) << 16u);
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+         {
+             uint32_t value;
+@@ -94,6 +99,13 @@ namespace ps2x::iop::detail
+     void IopMemory::write8(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End)
++        {
++            const uint32_t par = phys & ~1u;
++            const uint32_t desloc = (phys & 1u) * 8u;
++            m_spu2.write16(par, static_cast<uint16_t>((m_spu2.read16(par) & ~(0xFFu << desloc)) | (static_cast<uint32_t>(value) << desloc)));
++            return;
++        }
+         if (phys < RamSize)
+         {
+             m_ram[phys] = value;
+@@ -115,6 +127,11 @@ namespace ps2x::iop::detail
+     void IopMemory::write16(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End)
++        {
++            m_spu2.write16(phys & ~1u, value);
++            return;
++        }
+         if (phys + 1u < RamSize)
+         {
+             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
+@@ -128,6 +145,12 @@ namespace ps2x::iop::detail
+     void IopMemory::write32(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End)
++        {
++            m_spu2.write16(phys & ~1u, static_cast<uint16_t>(value));
++            m_spu2.write16((phys & ~1u) + 2u, static_cast<uint16_t>(value >> 16u));
++            return;
++        }
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+         {
+             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
+@@ -253,15 +276,6 @@ namespace ps2x::iop::detail
+         const bool secondCore = address == kDmaSpu1Chcr;
+         m_hardware[address] = value & ~kDmaStart;
+ 
+-        const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
+-        const uint32_t alignedStatus = statusAddress & ~3u;
+-        const uint32_t shift = (statusAddress & 2u) * 8u;
+-        uint32_t status = 0u;
+-        if (const auto current = m_hardware.find(alignedStatus); current != m_hardware.end())
+-            status = current->second;
+-        status |= 0x80u << shift;
+-        m_hardware[alignedStatus] = status;
+-
+         const uint32_t blockControlAddress = address - sizeof(uint32_t);
+         uint32_t blockControl = 0u;
+         if (const auto current = m_hardware.find(blockControlAddress); current != m_hardware.end())
+@@ -269,6 +283,12 @@ namespace ps2x::iop::detail
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
++        uint32_t madr = 0u;
++        if (const auto current = m_hardware.find(address - 8u); current != m_hardware.end())
++            madr = current->second;
++        // Bit 0 do CHCR: 1 = da RAM do IOP para o SPU2. AutoDMA completa quando os dados sao consumidos, nao aqui.
++        if (!m_spu2.iniciarDma(secondCore ? 1 : 0, m_ram.data(), RamSize, madr, transferWords * 2u, (value & 1u) != 0u))
++            return;
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+             std::max<uint64_t>(transferWords * 2u, 64u),
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+new file mode 100644
+index 0000000..95a90a1
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -0,0 +1,107 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    // Emulacao do SPU2 do PS2: memoria de som, DMA, 2 x 24 vozes ADPCM com envelope ADSR, AutoDMA e mixagem por nucleo.
++    // Roda no ritmo do IOP (uma amostra de 48 kHz a cada 768 ciclos). Fora, por enquanto: reverb, modulacao de pitch e ruido.
++    class IopSpu2
++    {
++    public:
++        static constexpr uint32_t kRamPalavras = 0x100000u; // 2 MB em palavras de 16 bits
++        static constexpr uint32_t kIrqSpu = 1u, kIrqDma0 = 2u, kIrqDma1 = 4u;
++
++        IopSpu2();
++        void reset();
++
++        [[nodiscard]] uint16_t read16(uint32_t enderecoFisico);
++        void write16(uint32_t enderecoFisico, uint16_t valor);
++
++        // Inicio de DMA (CHCR com o bit de start). Devolve true para transferencia em bloco, que quem chama completa com a
++        // interrupcao de sempre; false para AutoDMA, cuja interrupcao sai de takeIrqs quando os dados forem consumidos.
++        bool iniciarDma(int core, uint8_t *ramIop, uint32_t tamanhoRamIop, uint32_t madr, uint64_t palavras16, bool daRamParaSpu);
++
++        // Gera as amostras devidas ate o ciclo do IOP dado.
++        void avancar(uint64_t cicloIop, const uint8_t *ramIop, uint32_t tamanhoRamIop);
++
++        // Bits kIrq* pendentes; zera ao ler.
++        [[nodiscard]] uint32_t takeIrqs() noexcept;
++
++    private:
++        enum class Fase : uint8_t
++        {
++            Desligada,
++            Ataque,
++            Queda,
++            Sustentacao,
++            Soltura
++        };
++
++        struct Voz
++        {
++            uint32_t nax = 0;
++            uint32_t lsa = 0;
++            bool lsaDefinido = false;
++            uint32_t contador = 0;
++            int bloco = 28; // proxima amostra a consumir de decodificado; 28 = carregar bloco
++            std::array<int32_t, 28> decodificado{};
++            std::array<int32_t, 4> historico{};
++            int32_t prev1 = 0, prev2 = 0;
++            uint8_t flagsBloco = 0;
++            bool fimPendente = false;
++            Fase fase = Fase::Desligada;
++            int32_t envelope = 0;
++            int32_t atrasoEnvelope = 0;
++            int32_t volEsq = 0, volDir = 0;
++            int32_t atrasoEsq = 0, atrasoDir = 0;
++        };
++
++        struct AutoDma
++        {
++            bool ativo = false;
++            uint32_t madr = 0;
++            uint64_t restantes = 0; // palavras de 16 bits
++            uint32_t indice = 0;    // 0..255 dentro do bloco atual (256 esq + 256 dir)
++        };
++
++        struct Core
++        {
++            std::array<Voz, 24> vozes{};
++            uint32_t konPendente = 0, koffPendente = 0, endx = 0;
++            uint32_t tsa = 0;
++            int32_t mvolEsq = 0, mvolDir = 0;
++            int32_t saidaEsq = 0, saidaDir = 0;
++            AutoDma adma{};
++        };
++
++        uint16_t &reg(uint32_t deslocamento) { return m_regs[deslocamento >> 1u]; }
++        void gerarAmostra(const uint8_t *ramIop, uint32_t tamanhoRamIop);
++        void aplicarKeyOnOff(Core &c, int core);
++        int32_t tickVoz(Core &c, int core, int indice);
++        void carregarBloco(Core &c, int core, int indice);
++        void tickEnvelope(Voz &v, uint16_t adsr1, uint16_t adsr2);
++        void conferirIrq(uint32_t endereco, uint32_t palavras);
++        void tickVolume(int32_t &atual, int32_t &atraso, uint16_t regValor);
++        void imprimirCenso();
++
++        std::vector<uint16_t> m_ram;
++        std::array<uint16_t, 0x400> m_regs{};
++        std::array<Core, 2> m_cores{};
++        uint64_t m_proximaAmostra = 0;
++        bool m_iniciado = false;
++        uint32_t m_irqs = 0;
++
++        // Diagnostico (PS2X_SPU_CENSO=1, PS2X_SPU_PCM=arquivo)
++        std::FILE *m_pcm = nullptr;
++        bool m_censo = false;
++        uint64_t m_amostras = 0, m_kon[2]{}, m_dmaBlocos[2]{}, m_dmaPalavras[2]{}, m_adma[2]{}, m_admaPalavras[2]{}, m_irqSpu = 0;
++        uint64_t m_escritasReg = 0, m_blocosAdpcm = 0;
++        int32_t m_pico = 0;
++        int64_t m_proximoCenso = 0;
++    };
++}
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+new file mode 100644
+index 0000000..120765c
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -0,0 +1,572 @@
++#include "iop_spu2.h"
++#include "ps2x/iop/iop_spu2_saida.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++
++namespace ps2x::iop
++{
++    namespace
++    {
++        // Anel entre o IOP (produtor) e o callback de audio do host (consumidor): 2 s de estereo.
++        constexpr size_t kAnelQuadros = 96000u;
++        int16_t g_anel[kAnelQuadros * 2u];
++        std::atomic<uint64_t> g_escrita{0u}, g_leitura{0u};
++    }
++
++    size_t ps2xSpu2LerSaida(int16_t *intercalado, size_t quadros)
++    {
++        const uint64_t e = g_escrita.load(std::memory_order_acquire);
++        uint64_t l = g_leitura.load(std::memory_order_relaxed);
++        const size_t disponiveis = static_cast<size_t>(std::min<uint64_t>(e - l, quadros));
++        for (size_t i = 0; i < disponiveis; ++i, ++l)
++        {
++            const size_t p = static_cast<size_t>(l % kAnelQuadros);
++            intercalado[i * 2u] = g_anel[p * 2u];
++            intercalado[i * 2u + 1u] = g_anel[p * 2u + 1u];
++        }
++        std::memset(intercalado + disponiveis * 2u, 0, (quadros - disponiveis) * 2u * sizeof(int16_t));
++        g_leitura.store(l, std::memory_order_release);
++        return disponiveis;
++    }
++
++    namespace
++    {
++        void empurrarSaida(int16_t esq, int16_t dir)
++        {
++            const uint64_t e = g_escrita.load(std::memory_order_relaxed);
++            if (e - g_leitura.load(std::memory_order_acquire) >= kAnelQuadros)
++                return; // anel cheio: descarta
++            const size_t p = static_cast<size_t>(e % kAnelQuadros);
++            g_anel[p * 2u] = esq;
++            g_anel[p * 2u + 1u] = dir;
++            g_escrita.store(e + 1u, std::memory_order_release);
++        }
++    }
++}
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        constexpr uint32_t kCiclosPorAmostra = 768u; // 36,864 MHz / 48 kHz
++        constexpr uint32_t kRegCore = 0x400u;
++
++        // Registradores por nucleo (deslocamento dentro dos 0x400 do nucleo).
++        constexpr uint32_t kPmonL = 0x180, kNonL = 0x184, kVmixLL = 0x188, kVmixLH = 0x18A, kVmixRL = 0x190, kVmixRH = 0x192;
++        constexpr uint32_t kMmix = 0x198, kAttr = 0x19A, kIrqaH = 0x19C, kIrqaL = 0x19E, kKonL = 0x1A0, kKonH = 0x1A2, kKoffL = 0x1A4,
++                           kKoffH = 0x1A6, kTsaH = 0x1A8, kTsaL = 0x1AA, kDados = 0x1AC, kAdmas = 0x1B0;
++        constexpr uint32_t kEnderecosVoz = 0x1C0, kEndxL = 0x340, kEndxH = 0x342, kStatx = 0x344;
++        constexpr uint32_t kMvol = 0x760, kCoreVolPasso = 0x28; // MVOLL/MVOLR em 0x760/0x762; nucleo 1 em +0x28
++
++        inline int32_t satura16(int32_t v)
++        {
++            return std::clamp(v, -32768, 32767);
++        }
++
++        inline int32_t hermite(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t frac12)
++        {
++            const float t = static_cast<float>(frac12) / 4096.0f;
++            const float c0 = static_cast<float>(b);
++            const float c1 = 0.5f * static_cast<float>(c - a);
++            const float c2 = static_cast<float>(a) - 2.5f * static_cast<float>(b) + 2.0f * static_cast<float>(c) - 0.5f * static_cast<float>(d);
++            const float c3 = 0.5f * static_cast<float>(d - a) + 1.5f * static_cast<float>(b - c);
++            return static_cast<int32_t>(((c3 * t + c2) * t + c1) * t + c0);
++        }
++
++        // Um passo de envelope (mesma regra para ADSR e varredura de volume).
++        inline void passoEnvelope(int32_t &nivel, int32_t &atraso, int taxa, bool aumenta, bool exponencial)
++        {
++            const int desloc = taxa >> 2;
++            int32_t passo = aumenta ? (7 - (taxa & 3)) : (-8 + (taxa & 3));
++            int32_t ciclos = 1;
++            if (desloc < 11)
++                passo <<= (11 - desloc);
++            else
++                ciclos = 1 << (desloc - 11);
++            if (exponencial && aumenta && nivel > 0x6000)
++                ciclos *= 4;
++            if (exponencial && !aumenta)
++                passo = (passo * nivel) >> 15;
++            if (++atraso >= ciclos)
++            {
++                atraso = 0;
++                nivel = std::clamp(nivel + passo, 0, 0x7FFF);
++            }
++        }
++    }
++
++    IopSpu2::IopSpu2() : m_ram(kRamPalavras)
++    {
++        reset();
++    }
++
++    void IopSpu2::reset()
++    {
++        std::fill(m_ram.begin(), m_ram.end(), uint16_t{0});
++        m_regs.fill(0u);
++        m_cores = {};
++        m_proximaAmostra = 0u;
++        m_iniciado = false;
++        m_irqs = 0u;
++        m_censo = std::getenv("PS2X_SPU_CENSO") != nullptr;
++        if (const char *arquivo = std::getenv("PS2X_SPU_PCM"); arquivo && !m_pcm)
++            m_pcm = std::fopen(arquivo, "wb");
++    }
++
++    uint16_t IopSpu2::read16(uint32_t enderecoFisico)
++    {
++        const uint32_t d = enderecoFisico & 0x7FFu;
++        if (d < 0x760u)
++        {
++            const int core = d >= kRegCore ? 1 : 0;
++            Core &c = m_cores[core];
++            const uint32_t r = d - (core ? kRegCore : 0u);
++            if (r < 0x180u)
++            {
++                const Voz &v = c.vozes[r >> 4u];
++                if ((r & 0xFu) == 0xAu)
++                    return static_cast<uint16_t>(v.envelope);
++                if ((r & 0xFu) == 0xCu)
++                    return static_cast<uint16_t>(v.volEsq);
++                if ((r & 0xFu) == 0xEu)
++                    return static_cast<uint16_t>(v.volDir);
++            }
++            else if (r >= kEnderecosVoz && r < kEnderecosVoz + 24u * 12u)
++            {
++                const uint32_t i = (r - kEnderecosVoz) / 12u, campo = (r - kEnderecosVoz) % 12u;
++                const Voz &v = c.vozes[i];
++                if (campo == 8u)
++                    return static_cast<uint16_t>(v.nax >> 16u);
++                if (campo == 10u)
++                    return static_cast<uint16_t>(v.nax);
++            }
++            else if (r == kDados)
++            {
++                const uint16_t valor = m_ram[c.tsa];
++                c.tsa = (c.tsa + 1u) & (kRamPalavras - 1u);
++                return valor;
++            }
++            else if (r == kEndxL)
++                return static_cast<uint16_t>(c.endx);
++            else if (r == kEndxH)
++                return static_cast<uint16_t>(c.endx >> 16u);
++        }
++        return m_regs[d >> 1u];
++    }
++
++    void IopSpu2::write16(uint32_t enderecoFisico, uint16_t valor)
++    {
++        const uint32_t d = enderecoFisico & 0x7FFu;
++        ++m_escritasReg;
++        m_regs[d >> 1u] = valor;
++        if (d >= 0x760u)
++        {
++            for (int core = 0; core < 2; ++core)
++            {
++                const uint32_t base = kMvol + static_cast<uint32_t>(core) * kCoreVolPasso;
++                if (d == base && (valor & 0x8000u) == 0u)
++                    m_cores[core].mvolEsq = static_cast<int16_t>(static_cast<uint16_t>(valor << 1u));
++                else if (d == base + 2u && (valor & 0x8000u) == 0u)
++                    m_cores[core].mvolDir = static_cast<int16_t>(static_cast<uint16_t>(valor << 1u));
++            }
++            return;
++        }
++        const int core = d >= kRegCore ? 1 : 0;
++        Core &c = m_cores[core];
++        const uint32_t r = d - (core ? kRegCore : 0u);
++        if (r >= kEnderecosVoz && r < kEnderecosVoz + 24u * 12u)
++        {
++            const uint32_t i = (r - kEnderecosVoz) / 12u, campo = (r - kEnderecosVoz) % 12u;
++            Voz &v = c.vozes[i];
++            if (campo == 4u)
++            {
++                v.lsa = (v.lsa & 0xFFFFu) | ((static_cast<uint32_t>(valor) & 0xFu) << 16u);
++                v.lsaDefinido = true;
++            }
++            else if (campo == 6u)
++            {
++                v.lsa = (v.lsa & 0xF0000u) | valor;
++                v.lsaDefinido = true;
++            }
++            else if (campo == 8u)
++                v.nax = (v.nax & 0xFFFFu) | ((static_cast<uint32_t>(valor) & 0xFu) << 16u);
++            else if (campo == 10u)
++                v.nax = (v.nax & 0xF0000u) | valor;
++            return;
++        }
++        switch (r)
++        {
++        case kKonL:
++            c.konPendente |= valor;
++            break;
++        case kKonH:
++            c.konPendente |= static_cast<uint32_t>(valor & 0xFFu) << 16u;
++            break;
++        case kKoffL:
++            c.koffPendente |= valor;
++            break;
++        case kKoffH:
++            c.koffPendente |= static_cast<uint32_t>(valor & 0xFFu) << 16u;
++            break;
++        case kTsaH:
++            c.tsa = (c.tsa & 0xFFFFu) | ((static_cast<uint32_t>(valor) & 0xFu) << 16u);
++            break;
++        case kTsaL:
++            c.tsa = (c.tsa & 0xF0000u) | valor;
++            break;
++        case kDados:
++            m_ram[c.tsa] = valor;
++            c.tsa = (c.tsa + 1u) & (kRamPalavras - 1u);
++            break;
++        case kEndxL:
++            c.endx &= 0xFF0000u;
++            break;
++        case kEndxH:
++            c.endx &= 0x00FFFFu;
++            break;
++        default:
++            break;
++        }
++    }
++
++    bool IopSpu2::iniciarDma(int core, uint8_t *ramIop, uint32_t tamanhoRamIop, uint32_t madr, uint64_t palavras16, bool daRamParaSpu)
++    {
++        Core &c = m_cores[core];
++        reg(kStatx + (core ? kRegCore : 0u)) |= 0x80u;
++        const uint16_t admas = reg(kAdmas + (core ? kRegCore : 0u));
++        const uint32_t origem = madr & 0x1FFFFFu;
++        if ((admas & (core + 1u)) != 0u && daRamParaSpu)
++        {
++            c.adma.ativo = true;
++            c.adma.madr = origem;
++            c.adma.restantes = palavras16;
++            c.adma.indice = 0u;
++            ++m_adma[core];
++            m_admaPalavras[core] += palavras16;
++            return false;
++        }
++        ++m_dmaBlocos[core];
++        m_dmaPalavras[core] += palavras16;
++        for (uint64_t i = 0; i < palavras16; ++i)
++        {
++            const uint32_t a = origem + static_cast<uint32_t>(i) * 2u;
++            if (a + 2u > tamanhoRamIop)
++                break;
++            if (daRamParaSpu)
++            {
++                uint16_t valor;
++                std::memcpy(&valor, ramIop + a, sizeof(valor));
++                m_ram[c.tsa] = valor;
++            }
++            else
++                std::memcpy(ramIop + a, &m_ram[c.tsa], sizeof(uint16_t));
++            c.tsa = (c.tsa + 1u) & (kRamPalavras - 1u);
++        }
++        return true;
++    }
++
++    uint32_t IopSpu2::takeIrqs() noexcept
++    {
++        const uint32_t v = m_irqs;
++        m_irqs = 0u;
++        return v;
++    }
++
++    void IopSpu2::conferirIrq(uint32_t endereco, uint32_t palavras)
++    {
++        for (int core = 0; core < 2; ++core)
++        {
++            const uint32_t b = core ? kRegCore : 0u;
++            if ((reg(kAttr + b) & 0x40u) == 0u)
++                continue;
++            const uint32_t irqa = ((static_cast<uint32_t>(reg(kIrqaH + b)) & 0xFu) << 16u) | reg(kIrqaL + b);
++            if (irqa >= endereco && irqa < endereco + palavras)
++            {
++                m_irqs |= kIrqSpu;
++                ++m_irqSpu;
++                reg(kStatx + b) |= 0x40u;
++            }
++        }
++    }
++
++    void IopSpu2::aplicarKeyOnOff(Core &c, int core)
++    {
++        const uint32_t b = core ? kRegCore : 0u;
++        for (int i = 0; i < 24; ++i)
++        {
++            const uint32_t bit = 1u << i;
++            if (c.konPendente & bit)
++            {
++                Voz &v = c.vozes[i];
++                const uint32_t e = kEnderecosVoz + static_cast<uint32_t>(i) * 12u + b;
++                v.nax = ((static_cast<uint32_t>(reg(e)) & 0xFu) << 16u) | reg(e + 2u);
++                v.lsaDefinido = false;
++                v.contador = 0u;
++                v.bloco = 28;
++                v.prev1 = v.prev2 = 0;
++                v.historico.fill(0);
++                v.fimPendente = false;
++                v.flagsBloco = 0u;
++                v.fase = Fase::Ataque;
++                v.envelope = 0;
++                v.atrasoEnvelope = 0;
++                c.endx &= ~bit;
++                ++m_kon[core];
++            }
++            else if ((c.koffPendente & bit) && c.vozes[i].fase != Fase::Desligada)
++            {
++                c.vozes[i].fase = Fase::Soltura;
++                c.vozes[i].atrasoEnvelope = 0;
++            }
++        }
++        c.konPendente = 0u;
++        c.koffPendente = 0u;
++    }
++
++    void IopSpu2::carregarBloco(Core &c, int core, int indice)
++    {
++        Voz &v = c.vozes[indice];
++        static constexpr int32_t kF0[5] = {0, 60, 115, 98, 122};
++        static constexpr int32_t kF1[5] = {0, 0, -52, -55, -60};
++        if (v.fimPendente)
++        {
++            v.fimPendente = false;
++            c.endx |= 1u << indice;
++            if (v.flagsBloco & 2u)
++                v.nax = v.lsa;
++            else
++            {
++                v.fase = Fase::Desligada;
++                v.envelope = 0;
++                return;
++            }
++        }
++        conferirIrq(v.nax, 8u);
++        const uint16_t cabecalho = m_ram[v.nax & (kRamPalavras - 1u)];
++        const int desloc = cabecalho & 0xF;
++        const int filtro = std::min((cabecalho >> 4) & 0xF, 4);
++        const uint8_t flags = static_cast<uint8_t>(cabecalho >> 8);
++        if ((flags & 4u) && !v.lsaDefinido)
++            v.lsa = v.nax;
++        for (int s = 0; s < 28; ++s)
++        {
++            const uint16_t palavra = m_ram[(v.nax + 1u + static_cast<uint32_t>(s) / 4u) & (kRamPalavras - 1u)];
++            const int nibble = (palavra >> ((s & 3) * 4)) & 0xF;
++            int32_t amostra = static_cast<int32_t>(static_cast<int16_t>(static_cast<uint16_t>(nibble << 12))) >> std::min(desloc, 12);
++            amostra += (v.prev1 * kF0[filtro] + v.prev2 * kF1[filtro] + 32) >> 6;
++            amostra = satura16(amostra);
++            v.prev2 = v.prev1;
++            v.prev1 = amostra;
++            v.decodificado[s] = amostra;
++        }
++        v.flagsBloco = flags;
++        v.fimPendente = (flags & 1u) != 0u;
++        v.nax = (v.nax + 8u) & (kRamPalavras - 1u);
++        v.bloco = 0;
++        ++m_blocosAdpcm;
++        (void)core;
++    }
++
++    void IopSpu2::tickEnvelope(Voz &v, uint16_t adsr1, uint16_t adsr2)
++    {
++        switch (v.fase)
++        {
++        case Fase::Ataque:
++            passoEnvelope(v.envelope, v.atrasoEnvelope, (adsr1 >> 8) & 0x7F, true, (adsr1 & 0x8000u) != 0u);
++            if (v.envelope >= 0x7FFF)
++            {
++                v.fase = Fase::Queda;
++                v.atrasoEnvelope = 0;
++            }
++            break;
++        case Fase::Queda:
++        {
++            passoEnvelope(v.envelope, v.atrasoEnvelope, ((adsr1 >> 4) & 0xF) << 2, false, true);
++            const int32_t alvo = ((adsr1 & 0xF) + 1) * 0x800;
++            if (v.envelope <= alvo)
++            {
++                v.fase = Fase::Sustentacao;
++                v.atrasoEnvelope = 0;
++            }
++            break;
++        }
++        case Fase::Sustentacao:
++            passoEnvelope(v.envelope, v.atrasoEnvelope, (adsr2 >> 6) & 0x7F, (adsr2 & 0x4000u) == 0u, (adsr2 & 0x8000u) != 0u);
++            break;
++        case Fase::Soltura:
++            passoEnvelope(v.envelope, v.atrasoEnvelope, (adsr2 & 0x1F) << 2, false, (adsr2 & 0x20u) != 0u);
++            if (v.envelope <= 0)
++                v.fase = Fase::Desligada;
++            break;
++        default:
++            break;
++        }
++    }
++
++    void IopSpu2::tickVolume(int32_t &atual, int32_t &atraso, uint16_t regValor)
++    {
++        if ((regValor & 0x8000u) == 0u)
++        {
++            atual = static_cast<int16_t>(static_cast<uint16_t>(regValor << 1u));
++            return;
++        }
++        int32_t magnitude = std::abs(atual);
++        passoEnvelope(magnitude, atraso, regValor & 0x7F, (regValor & 0x2000u) == 0u, (regValor & 0x4000u) != 0u);
++        atual = atual < 0 ? -magnitude : magnitude;
++    }
++
++    int32_t IopSpu2::tickVoz(Core &c, int core, int indice)
++    {
++        Voz &v = c.vozes[indice];
++        if (v.fase == Fase::Desligada)
++            return 0;
++        const uint32_t b = (core ? kRegCore : 0u) + static_cast<uint32_t>(indice) * 0x10u;
++        const uint32_t passo = std::min<uint32_t>(reg(b + 4u), 0x3FFFu);
++        if (v.bloco >= 28)
++        {
++            carregarBloco(c, core, indice);
++            if (v.fase == Fase::Desligada)
++                return 0;
++        }
++        const int32_t saida = hermite(v.historico[0], v.historico[1], v.historico[2], v.historico[3], v.contador & 0xFFFu);
++        v.contador += passo;
++        while (v.contador >= 0x1000u)
++        {
++            v.contador -= 0x1000u;
++            if (v.bloco >= 28)
++            {
++                carregarBloco(c, core, indice);
++                if (v.fase == Fase::Desligada)
++                    return 0;
++            }
++            v.historico[0] = v.historico[1];
++            v.historico[1] = v.historico[2];
++            v.historico[2] = v.historico[3];
++            v.historico[3] = v.decodificado[v.bloco++];
++        }
++        tickEnvelope(v, reg(b + 6u), reg(b + 8u));
++        tickVolume(v.volEsq, v.atrasoEsq, reg(b + 0u));
++        tickVolume(v.volDir, v.atrasoDir, reg(b + 2u));
++        return (satura16(saida) * v.envelope) >> 15;
++    }
++
++    void IopSpu2::gerarAmostra(const uint8_t *ramIop, uint32_t tamanhoRamIop)
++    {
++        int32_t externoEsq = 0, externoDir = 0;
++        for (int core = 0; core < 2; ++core)
++        {
++            Core &c = m_cores[core];
++            const uint32_t b = core ? kRegCore : 0u;
++            if (c.konPendente | c.koffPendente)
++                aplicarKeyOnOff(c, core);
++            const uint32_t vmixL = reg(kVmixLL + b) | (static_cast<uint32_t>(reg(kVmixLH + b)) << 16u);
++            const uint32_t vmixR = reg(kVmixRL + b) | (static_cast<uint32_t>(reg(kVmixRH + b)) << 16u);
++            int32_t somaEsq = 0, somaDir = 0;
++            for (int i = 0; i < 24; ++i)
++            {
++                if (c.vozes[i].fase == Fase::Desligada)
++                    continue;
++                const int32_t s = tickVoz(c, core, i);
++                const Voz &v = c.vozes[i];
++                if (vmixL & (1u << i))
++                    somaEsq += (s * v.volEsq) >> 15;
++                if (vmixR & (1u << i))
++                    somaDir += (s * v.volDir) >> 15;
++            }
++            int32_t admaEsq = 0, admaDir = 0;
++            if (c.adma.ativo)
++            {
++                const uint32_t a = c.adma.madr + c.adma.indice * 2u;
++                if (a + 1026u <= tamanhoRamIop)
++                {
++                    int16_t e, d;
++                    std::memcpy(&e, ramIop + a, 2);
++                    std::memcpy(&d, ramIop + a + 512u, 2);
++                    admaEsq = e;
++                    admaDir = d;
++                }
++                if (++c.adma.indice >= 256u)
++                {
++                    c.adma.indice = 0u;
++                    c.adma.madr += 1024u;
++                    c.adma.restantes = c.adma.restantes > 512u ? c.adma.restantes - 512u : 0u;
++                    if (c.adma.restantes == 0u)
++                    {
++                        c.adma.ativo = false;
++                        m_irqs |= core ? kIrqDma1 : kIrqDma0;
++                    }
++                }
++            }
++            const uint16_t mmix = reg(kMmix + b);
++            int32_t secoEsq = 0, secoDir = 0;
++            if (mmix & 0x800u) secoEsq += somaEsq;
++            if (mmix & 0x400u) secoDir += somaDir;
++            if (mmix & 0x080u) secoEsq += admaEsq;
++            if (mmix & 0x040u) secoDir += admaDir;
++            if (mmix & 0x008u) secoEsq += externoEsq;
++            if (mmix & 0x004u) secoDir += externoDir;
++            c.saidaEsq = satura16((satura16(secoEsq) * c.mvolEsq) >> 15);
++            c.saidaDir = satura16((satura16(secoDir) * c.mvolDir) >> 15);
++            externoEsq = c.saidaEsq;
++            externoDir = c.saidaDir;
++        }
++        const int16_t esq = static_cast<int16_t>(m_cores[1].saidaEsq);
++        const int16_t dir = static_cast<int16_t>(m_cores[1].saidaDir);
++        ps2x::iop::empurrarSaida(esq, dir);
++        if (m_pcm)
++        {
++            const int16_t par[2] = {esq, dir};
++            std::fwrite(par, sizeof(par), 1u, m_pcm);
++        }
++        ++m_amostras;
++        m_pico = std::max({m_pico, std::abs(static_cast<int32_t>(esq)), std::abs(static_cast<int32_t>(dir))});
++    }
++
++    void IopSpu2::avancar(uint64_t cicloIop, const uint8_t *ramIop, uint32_t tamanhoRamIop)
++    {
++        if (!m_iniciado)
++        {
++            m_iniciado = true;
++            m_proximaAmostra = cicloIop;
++        }
++        while (cicloIop >= m_proximaAmostra)
++        {
++            gerarAmostra(ramIop, tamanhoRamIop);
++            m_proximaAmostra += kCiclosPorAmostra;
++        }
++        if (m_censo || m_pcm)
++            imprimirCenso();
++    }
++
++    void IopSpu2::imprimirCenso()
++    {
++        const int64_t agora = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        if (m_proximoCenso == 0)
++            m_proximoCenso = agora + 5;
++        if (agora < m_proximoCenso)
++            return;
++        m_proximoCenso = agora + 5;
++        if (m_pcm)
++            std::fflush(m_pcm);
++        if (!m_censo)
++            return;
++        int ativas[2]{};
++        for (int core = 0; core < 2; ++core)
++            for (const Voz &v : m_cores[core].vozes)
++                ativas[core] += v.fase != Fase::Desligada ? 1 : 0;
++        std::fprintf(stderr, "[spu2] amostras=%llu kon=%llu/%llu ativas=%d/%d dma_blocos=%llu/%llu dma_palavras=%llu/%llu adma=%llu/%llu adma_palavras=%llu/%llu irq=%llu regs=%llu adpcm=%llu pico=%d mmix=%04x/%04x mvol=%d/%d%c",
++                     (unsigned long long)m_amostras, (unsigned long long)m_kon[0], (unsigned long long)m_kon[1], ativas[0], ativas[1],
++                     (unsigned long long)m_dmaBlocos[0], (unsigned long long)m_dmaBlocos[1], (unsigned long long)m_dmaPalavras[0], (unsigned long long)m_dmaPalavras[1],
++                     (unsigned long long)m_adma[0], (unsigned long long)m_adma[1], (unsigned long long)m_admaPalavras[0], (unsigned long long)m_admaPalavras[1],
++                     (unsigned long long)m_irqSpu, (unsigned long long)m_escritasReg, (unsigned long long)m_blocosAdpcm, m_pico,
++                     reg(kMmix), reg(kMmix + kRegCore), m_cores[1].mvolEsq, m_cores[1].mvolDir, 10);
++        m_amostras = 0u;
++        m_pico = 0;
++        m_escritasReg = 0u;
++        m_blocosAdpcm = 0u;
++    }
++}
+diff --git a/ps2xIOP/include/ps2x/iop/iop_spu2_saida.h b/ps2xIOP/include/ps2x/iop/iop_spu2_saida.h
+new file mode 100644
+index 0000000..19b41de
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/iop_spu2_saida.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace ps2x::iop
++{
++    // Copia ate `quadros` quadros estereo (48 kHz, 16 bits, intercalados) gerados pelo SPU2 emulado; o que faltar vira silencio.
++    // Devolve quantos quadros eram reais. Pode ser chamada da thread de audio do host.
++    size_t ps2xSpu2LerSaida(int16_t *intercalado, size_t quadros);
++}
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 07a783c..ec44c24 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2x/iop/iop_sreg.h"
++#include <chrono>
+ #include <cstdlib>
+ #include <cstdio>
+ #include "iop_emulator.h"
+@@ -608,6 +609,16 @@ namespace ps2x::iop::detail
+                 const uint64_t target = totalCycles + cycles;
+                 while (totalCycles < target)
+                 {
++                    memory.avancarSpu2(totalCycles);
++                    if (const uint32_t irqsSpu = memory.takeIrqsSpu2())
++                    {
++                        if (irqsSpu & IopSpu2::kIrqSpu)
++                            pendingDmaInterrupts[9] = totalCycles;
++                        if (irqsSpu & IopSpu2::kIrqDma0)
++                            pendingDmaInterrupts[0x24] = totalCycles;
++                        if (irqsSpu & IopSpu2::kIrqDma1)
++                            pendingDmaInterrupts[0x28] = totalCycles;
++                    }
+                     drainEeSifCommands();
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+@@ -804,12 +815,33 @@ namespace ps2x::iop::detail
+             return static_cast<uint64_t>(valor > 0 ? valor : 1);
+         }();
+         m_impl->ciclosEmLote += iopCycles;
+-        if (m_impl->ciclosEmLote >= lote)
++        if (m_impl->ciclosEmLote < lote)
++            return;
++        const uint64_t ciclos = m_impl->ciclosEmLote;
++        m_impl->ciclosEmLote = 0u;
++
++        // Tempo real: o IOP (e o SPU2, que gera uma amostra a cada 768 ciclos) segue o relogio do PC, nao a contagem de funcoes
++        // despachadas pelo EE, que varia com a cena. Assim o som sai a 48 kHz mesmo com o jogo lento.
++        // PS2X_IOP_TEMPO_REAL=0 volta a usar os ciclos estimados do EE.
++        static const bool tempoReal = []
++        {
++            const char *env = std::getenv("PS2X_IOP_TEMPO_REAL");
++            return !env || std::atoi(env) != 0;
++        }();
++        if (!tempoReal)
+         {
+-            const uint64_t ciclos = m_impl->ciclosEmLote;
+-            m_impl->ciclosEmLote = 0u;
+             m_impl->runCycles(ciclos);
+-        }
++            return;
++        }
++        constexpr uint64_t kIopHz = 36864000u;
++        constexpr uint64_t kMaximoPorChamada = kIopHz / 10u; // no maximo 100 ms de IOP por vez; o atraso e recuperado nas seguintes
++        using Relogio = std::chrono::steady_clock;
++        static const Relogio::time_point inicio = Relogio::now();
++        static const uint64_t cicloInicial = m_impl->totalCycles;
++        const uint64_t decorridoNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Relogio::now() - inicio).count());
++        const uint64_t alvo = cicloInicial + static_cast<uint64_t>(static_cast<double>(decorridoNs) * (static_cast<double>(kIopHz) / 1.0e9));
++        if (alvo > m_impl->totalCycles)
++            m_impl->runCycles(std::min(alvo - m_impl->totalCycles, kMaximoPorChamada));
+     }
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index a2db0a3..e5e577a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,4 @@
++#include "ps2x/iop/iop_spu2_saida.h"
+ #include <vector>
+ #include <atomic>
+ 
+@@ -819,6 +820,14 @@ bool PS2Runtime::initialize(const char *title)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
++        if (IsAudioDeviceReady())
++        {
++            // Saida do SPU2 emulado (ps2xIOP): o callback roda na thread de audio do host e so le o anel.
++            static AudioStream s_saidaSpu2 = LoadAudioStream(48000, 16, 2);
++            SetAudioStreamCallback(s_saidaSpu2, [](void *dados, unsigned int quadros)
++                                   { ps2x::iop::ps2xSpu2LerSaida(static_cast<int16_t *>(dados), quadros); });
++            PlayAudioStream(s_saidaSpu2);
++        }
+ #endif
+         SetTargetFPS(60);
+         if (m_debugUiInitCallback)

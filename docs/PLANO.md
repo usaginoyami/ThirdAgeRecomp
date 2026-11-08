@@ -23,7 +23,7 @@
 
 ## Fase 4 — Mídia
 - [ ] Vídeos (MPEG-2/IPU)
-- [ ] Áudio SPU2 e músicas
+- [x] Áudio SPU2 e músicas (patch 0037; ainda sem reverb, PMON e ruído)
 
 ## Fase 5 — Pacote
 - [ ] Kit de um clique (extrair, recompilar, compilar, rodar)
