@@ -1,0 +1,125 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 3ad538e..07a783c 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -134,6 +134,7 @@ namespace ps2x::iop::detail
+             totalCycles = 0;
+             totalInstructions = 0;
+             eeCycleCarry = 0;
++            ciclosEmLote = 0;
+             activeCpu = nullptr;
+             lastError.clear();
+             servicingDmaInterrupts = false;
+@@ -751,6 +752,7 @@ namespace ps2x::iop::detail
+         uint64_t totalCycles = 0;
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
++        uint64_t ciclosEmLote = 0u;
+         CpuState *activeCpu = nullptr;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+@@ -793,8 +795,21 @@ namespace ps2x::iop::detail
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+         const uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;
+-        if (iopCycles)
+-            m_impl->runCycles(iopCycles);
++        // O EE contabiliza 8 ciclos por despacho de funcao guest (1 ciclo do IOP): rodar o IOP a cada um pagava a passada
++        // inteira do caminho ocioso. PS2X_IOP_LOTE=N acumula N ciclos do IOP antes de rodar (padrao 64; 1 = a cada ciclo).
++        static const uint64_t lote = []
++        {
++            const char *env = std::getenv("PS2X_IOP_LOTE");
++            const long valor = env ? std::atol(env) : 64;
++            return static_cast<uint64_t>(valor > 0 ? valor : 1);
++        }();
++        m_impl->ciclosEmLote += iopCycles;
++        if (m_impl->ciclosEmLote >= lote)
++        {
++            const uint64_t ciclos = m_impl->ciclosEmLote;
++            m_impl->ciclosEmLote = 0u;
++            m_impl->runCycles(ciclos);
++        }
+     }
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 91ed7d3..a2db0a3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2567,8 +2567,8 @@ void PS2Runtime::run()
+     uint64_t tick = 0;
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
++        tick++;
+         PS2_IF_AGRESSIVE_LOGS({
+-            tick++;
+             if ((tick % 120) == 0)
+             {
+                 uint64_t curDma = m_memory.dmaStartCount();
+@@ -2597,21 +2597,24 @@ void PS2Runtime::run()
+                                                << " vif=" << curVif
+                                                << std::endl);
+                 ps2xPrintStats();
+-                ps2xMaybeDumpVram(tick, m_memory.getGSVRAM());
++            }
++        });
++        // Fora de PS2_IF_AGRESSIVE_LOGS: o despejo (PS2X_VRAM_DUMP) precisa funcionar sem os logs de compilacao.
++        if ((tick % 120) == 0)
++        {
++            ps2xMaybeDumpVram(tick, m_memory.getGSVRAM());
++            {
++                static bool vuDespejada = false;
++                if (!vuDespejada && std::getenv("PS2X_VRAM_DUMP") && tick >= std::strtoull(std::getenv("PS2X_VRAM_DUMP"), nullptr, 0))
+                 {
+-                    static bool vuDespejada = false;
+-                    if (!vuDespejada && std::getenv("PS2X_VRAM_DUMP") && tick >= std::strtoull(std::getenv("PS2X_VRAM_DUMP"), nullptr, 0))
+-                    {
+-                        vuDespejada = true;
+-                        std::ofstream("ps2x_vu0_code.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getVU0Code()), PS2_VU0_CODE_SIZE);
+-                        std::ofstream("ps2x_vu0_data.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getVU0Data()), PS2_VU0_DATA_SIZE);
+-                        std::ofstream("ps2x_vu1_data.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getVU1Data()), PS2_VU1_DATA_SIZE);
+-                        std::ofstream("ps2x_rdram.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getRDRAM()), PS2_RAM_SIZE);
+-                    }
++                    vuDespejada = true;
++                    std::ofstream("ps2x_vu0_code.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getVU0Code()), PS2_VU0_CODE_SIZE);
++                    std::ofstream("ps2x_vu0_data.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getVU0Data()), PS2_VU0_DATA_SIZE);
++                    std::ofstream("ps2x_vu1_data.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getVU1Data()), PS2_VU1_DATA_SIZE);
++                    std::ofstream("ps2x_rdram.raw", std::ios::binary).write(reinterpret_cast<const char *>(m_memory.getRDRAM()), PS2_RAM_SIZE);
+                 }
+-
+             }
+-        });
++        }
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+diff --git a/ps2xRuntime/src/lib/thirdage_perfil.cpp b/ps2xRuntime/src/lib/thirdage_perfil.cpp
+index f00efd4..4f093b9 100644
+--- a/ps2xRuntime/src/lib/thirdage_perfil.cpp
++++ b/ps2xRuntime/src/lib/thirdage_perfil.cpp
+@@ -37,6 +37,7 @@ void ps2xIniciarPerfil()
+         std::map<std::string, uint64_t> foraDoExe;
+         std::map<DWORD, uint64_t> porThreadFora;
+         std::map<uint64_t, uint64_t> chamadorDaDll;
++        std::map<std::string, uint64_t> dentroDaDll; // "thread dll rva (decimal, grao de 16)"
+         std::map<uint64_t, uint64_t> chamador2;
+         for (;;)
+         {
+@@ -72,6 +73,8 @@ void ps2xIniciarPerfil()
+                                 if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(c.Rip), &m) && m)
+                                     GetModuleBaseNameA(GetCurrentProcess(), m, nome, sizeof(nome));
+                                 ++foraDoExe[nome];
++                                if (m)
++                                    ++dentroDaDll[std::to_string(te.th32ThreadID) + " " + nome + " " + std::to_string((c.Rip - reinterpret_cast<uint64_t>(m)) & ~15ull)];
+                                 ++porThreadFora[te.th32ThreadID];
+                                 // Sobe a pilha (unwind do x64) ate o primeiro quadro dentro do .exe: mostra quem chamou a DLL.
+                                 CONTEXT u = c;
+@@ -130,6 +133,8 @@ void ps2xIniciarPerfil()
+                         std::fprintf(f, "thread_fora %lu %llu%c", static_cast<unsigned long>(p.first), static_cast<unsigned long long>(p.second), 10);
+                     for (const auto &p : contagem)
+                         std::fprintf(f, "%llx %llu\n", static_cast<unsigned long long>(p.first), static_cast<unsigned long long>(p.second));
++                    for (const auto &p : dentroDaDll)
++                        std::fprintf(f, "dll %s %llu%c", p.first.c_str(), static_cast<unsigned long long>(p.second), 10);
+                     for (const auto &p : chamadorDaDll)
+                         std::fprintf(f, "chamador %llx %llu\n", static_cast<unsigned long long>(p.first), static_cast<unsigned long long>(p.second));
+                     for (const auto &p : chamador2)

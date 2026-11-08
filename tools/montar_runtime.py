@@ -141,7 +141,7 @@ def montar():
         print("VU1: blocos traduzidos de generated/vu1/ps2_vu1_traduzido.cpp")
 
 
-def compilar(tipo):
+def compilar(tipo, com_logs=False):
     bd = os.path.join(RAIZ, "build", "runtime")
     limpa_cache_se_mudou(bd)
     # o codigo gerado usa SSE4.1 (_mm_blendv_ps etc.); gcc/clang precisam do flag
@@ -150,7 +150,9 @@ def compilar(tipo):
     gen = ["-G", "Ninja"] if shutil.which("ninja") else []
     run(["cmake", "-S", STAGE, "-B", bd, *gen, f"-DCMAKE_BUILD_TYPE={tipo}", *sse,
          "-DPS2X_BUILD_RECOMP=OFF", "-DPS2X_BUILD_ANALYZER=OFF", "-DPS2X_BUILD_TEST=OFF",
-         "-DPS2X_BUILD_STUDIO=OFF", "-DPS2X_ENABLE_DEBUG_UI=OFF"])
+         "-DPS2X_BUILD_STUDIO=OFF", "-DPS2X_ENABLE_DEBUG_UI=OFF",
+         # Os logs de compilacao passam por toda funcao do jogo e custam ~7% na cena; --com-logs liga para depurar.
+         f"-DPS2X_ENABLE_AGRESSIVE_LOGS={'ON' if com_logs else 'OFF'}", f"-DPS2X_ENABLE_RUNTIME_LOGS={'ON' if com_logs else 'OFF'}"])
     run(["cmake", "--build", bd, "--target", "ps2EntryRunner", "--config", tipo, "-j", str(os.cpu_count() or 2)])
 
 
@@ -159,12 +161,13 @@ def main():
     ap.add_argument("--gerar", action="store_true", help="recompila o ELF antes (gera generated/)")
     ap.add_argument("--so-montar", action="store_true", help="so copia para build/stage, sem compilar")
     ap.add_argument("--tipo", default="Release")
+    ap.add_argument("--com-logs", action="store_true", help="liga os logs de compilacao ([run:tick], [stats], trace de funcoes)")
     a = ap.parse_args()
     if a.gerar:
         gerar(a.tipo)
     montar()
     if not a.so_montar:
-        compilar(a.tipo)
+        compilar(a.tipo, a.com_logs)
 
 
 if __name__ == "__main__":
