@@ -1,0 +1,72 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index b5e3f72..13f0257 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -303,7 +303,14 @@ namespace
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        // Valor sempre em [0, 255]: somar 0,5 e truncar evita chamar lround para cada canal de cada texel.
++        return clampU8(static_cast<int>(top + (bottom - top) * fy + 0.5f));
++    }
++
++    inline int pisoRapido(float x)
++    {
++        const int truncado = static_cast<int>(x);
++        return truncado - (x < static_cast<float>(truncado) ? 1 : 0);
+     }
+ }
+ 
+@@ -1478,8 +1485,8 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+ 
+     const float sampleU = texUf - 0.5f;
+     const float sampleV = texVf - 0.5f;
+-    const int u0 = static_cast<int>(std::floor(sampleU));
+-    const int v0 = static_cast<int>(std::floor(sampleV));
++    const int u0 = pisoRapido(sampleU);
++    const int v0 = pisoRapido(sampleV);
+     const int u1 = u0 + 1;
+     const int v1 = v0 + 1;
+     const float fx = sampleU - static_cast<float>(u0);
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 563bcbd..d9975ec 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -13,7 +13,10 @@
+ #include <filesystem>
+ #include <exception>
+ #include <algorithm>
++#include <chrono>
++#include <cstdio>
+ #include <cstdlib>
++#include <thread>
+ 
+ #if defined(__ANDROID__)
+ #include <android/log.h>
+@@ -170,6 +173,25 @@ int main(int argc, char *argv[])
+     redirectStdioToLogcat();
+ #endif
+     setupTerminateLogger();
++    // Cada linha de log ia direto para o arquivo, na thread que imprimiu (~9% da thread do EE na cena). Agora ha um buffer
++    // esvaziado uma vez por segundo por uma thread propria. PS2X_LOG_IMEDIATO=1 volta a gravar linha a linha.
++    if (!std::getenv("PS2X_LOG_IMEDIATO"))
++    {
++        static char bufferSaida[1u << 16u];
++        static char bufferErro[1u << 16u];
++        std::setvbuf(stdout, bufferSaida, _IOFBF, sizeof(bufferSaida));
++        std::setvbuf(stderr, bufferErro, _IOFBF, sizeof(bufferErro));
++        std::thread([]
++                    {
++                        for (;;)
++                        {
++                            std::this_thread::sleep_for(std::chrono::seconds(1));
++                            std::fflush(stdout);
++                            std::fflush(stderr);
++                        }
++                    })
++            .detach();
++    }
+ 
+     try
+     {
